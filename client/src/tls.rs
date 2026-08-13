@@ -86,3 +86,29 @@ pub fn upgrade(stream: TcpStream, server_name: &str) -> Result<rustls::StreamOwn
     tls_stream.flush().context("performing TLS handshake")?;
     Ok(tls_stream)
 }
+
+#[cfg(test)]
+mod verify {
+    use super::*;
+
+    #[test]
+    fn verify_crypto_provider_ambiguity_resolved() {
+        // With two rustls crypto providers in the dependency tree (see main.rs's comment),
+        // `ClientConfig::builder()`/`ClientConnection::new()` panic instead of erroring if
+        // no default provider was installed process-wide first. `cargo test` runs every
+        // test in-process, so whichever test runs first performs the install; this one
+        // tolerates it already having happened (`install_default` erroring just means some
+        // other test won the race) — what actually matters is that building a config never
+        // panics either way.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TrustOnFirstUseVerifier))
+            .with_no_client_auth();
+        let name = ServerName::try_from("example.com".to_string()).unwrap();
+        // This is exactly where the ambiguous-provider panic fires — reaching this line
+        // without panicking is the whole point of the test.
+        let _conn = ClientConnection::new(Arc::new(config), name).expect("ClientConnection::new");
+    }
+}

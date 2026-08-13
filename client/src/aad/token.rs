@@ -92,6 +92,16 @@ pub struct RdpAccessToken {
     pub access_token: String,
 }
 
+/// How to obtain the OAuth authorization code from the AAD sign-in flow.
+pub enum AuthCodeSource<'a> {
+    /// Print the authorize URL and block on stdin for the user to paste back the
+    /// redirect URL (or bare code) themselves.
+    Manual,
+    /// Drive the login automatically via [`crate::aad_auto`], sourcing credentials from
+    /// the given 1Password item (cached locally after the first fetch).
+    Auto { op_item: &'a str, headless: bool },
+}
+
 #[derive(Deserialize)]
 struct TokenSuccessResponse {
     access_token: String,
@@ -105,11 +115,15 @@ struct TokenErrorResponse {
 
 /// Acquires an RDP Access Token for `scope` via the OAuth 2.0 Authorization Code Grant
 /// (MS-RDPBCGR "Acquiring an RDP Access Token"), binding it to `pop_key` via `req_cnf`.
-/// Interactive: prints a sign-in URL, the user completes sign-in in any browser, then
-/// pastes back the redirected URL (or just its `code` parameter) via stdin. This avoids
-/// needing a local redirect listener — the `nativeclient` redirect URI is Microsoft's own
-/// mechanism for exactly this case.
-pub fn acquire_rdp_access_token(http: &reqwest::blocking::Client, scope: &str, pop_key: &PopKey) -> Result<RdpAccessToken> {
+/// The `nativeclient` redirect URI is Microsoft's own mechanism for native clients that
+/// have no local redirect listener — `code_source` determines how the code that lands
+/// there gets back to us: pasted by hand, or captured by driving a browser ourselves.
+pub fn acquire_rdp_access_token(
+    http: &reqwest::blocking::Client,
+    scope: &str,
+    pop_key: &PopKey,
+    code_source: &AuthCodeSource,
+) -> Result<RdpAccessToken> {
     let req_cnf = URL_SAFE_NO_PAD.encode(format!(r#"{{"kid":"{}"}}"#, pop_key.thumbprint));
 
     let authorize_url = url::Url::parse_with_params(
@@ -124,20 +138,19 @@ pub fn acquire_rdp_access_token(http: &reqwest::blocking::Client, scope: &str, p
     )
     .context("building authorize URL")?;
 
-    println!("Open this URL in a browser and sign in with the account that should access this host:\n");
-    println!("  {authorize_url}\n");
-    println!("After sign-in you'll land on a login.microsoftonline.com/.../nativeclient page.");
-    print!("Paste the resulting page URL (or just the `code` value) here: ");
-    io::stdout().flush().ok();
-
-    let mut pasted = String::new();
-    io::stdin()
-        .lock()
-        .read_line(&mut pasted)
-        .context("reading pasted redirect URL/code from stdin")?;
-    let pasted = pasted.trim();
-
-    let code = extract_code(pasted).context("extracting `code` from pasted input")?;
+    let code = match code_source {
+        AuthCodeSource::Manual => acquire_code_manually(&authorize_url)?,
+        AuthCodeSource::Auto { op_item, headless } => {
+            let redirect_url = crate::aad_auto::acquire_redirect_url(
+                authorize_url.as_str(),
+                REDIRECT_URI,
+                op_item,
+                *headless,
+            )
+            .context("automated AAD login")?;
+            extract_code(&redirect_url).context("extracting `code` from captured redirect URL")?
+        }
+    };
 
     let resp = http
         .post(format!("{AUTHORITY}/oauth2/v2.0/token"))
@@ -171,6 +184,24 @@ pub fn acquire_rdp_access_token(http: &reqwest::blocking::Client, scope: &str, p
     Ok(RdpAccessToken {
         access_token: parsed.access_token,
     })
+}
+
+/// Prints the authorize URL and blocks on stdin for the user to paste back the redirected
+/// URL (or just its `code` parameter) after signing in themselves in any browser.
+fn acquire_code_manually(authorize_url: &url::Url) -> Result<String> {
+    println!("Open this URL in a browser and sign in with the account that should access this host:\n");
+    println!("  {authorize_url}\n");
+    println!("After sign-in you'll land on a login.microsoftonline.com/.../nativeclient page.");
+    print!("Paste the resulting page URL (or just the `code` value) here: ");
+    io::stdout().flush().ok();
+
+    let mut pasted = String::new();
+    io::stdin()
+        .lock()
+        .read_line(&mut pasted)
+        .context("reading pasted redirect URL/code from stdin")?;
+
+    extract_code(pasted.trim()).context("extracting `code` from pasted input")
 }
 
 /// Accepts either a bare authorization code or a full redirect URL containing `?code=...`.
