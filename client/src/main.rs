@@ -14,6 +14,7 @@ mod tls;
 mod vchannel;
 mod window;
 mod x224;
+mod zgfx;
 
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
@@ -387,8 +388,14 @@ fn main() -> Result<()> {
     println!("[3/4] awaiting handshake (Caps Confirm, Reset Graphics, Create Surface, Map Surface to Output)...");
     let mut frames_decoded = 0u32;
     let mut got_first_wire_to_surface = false;
+    // Everything the server sends on this channel is wrapped in a ZGFX (RDP 8.0 bulk
+    // compression) container — informal FreeRDP name, see MS-RDPEGFX §2.2.5 — that must be
+    // unwrapped before the bytes are valid RDPGFX_HEADER-prefixed PDUs. The client's own
+    // outgoing PDUs (e.g. CAPS_ADVERTISE above) are sent raw/unwrapped, matching FreeRDP.
+    let mut zgfx = zgfx::ZgfxContext::new();
     loop {
         let msg = router.recv_dvc_data(&mut tls_stream, user_id, gfx_channel_id)?;
+        let msg = zgfx.decompress(&msg)?;
         for pdu in gfx::split_pdus(&msg)? {
             match pdu {
                 gfx::GfxPdu::CapsConfirm => println!("      caps confirmed"),
