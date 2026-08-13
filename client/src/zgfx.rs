@@ -138,17 +138,22 @@ fn decode_token(reader: &mut BitReader) -> Result<&'static TokenRow> {
 /// Decodes a match length: `0` -> 3; otherwise a unary run of `1` bits (each doubling the
 /// base and widening the extra-bits field by one) terminated by `0`, then that many extra
 /// bits added on top. Matches FreeRDP's `zgfx_decompress_segment` length loop exactly.
-fn decode_length(reader: &mut BitReader) -> u32 {
+/// Legitimate streams never need `extra > 15` (max encodable length is 65535); a longer run
+/// means we've already desynced upstream — bail instead of reading a runaway bit count.
+fn decode_length(reader: &mut BitReader) -> Result<u32> {
     if reader.get_bits(1) == 0 {
-        return 3;
+        return Ok(3);
     }
     let mut count = 4u32;
     let mut extra = 2u32;
     while reader.get_bits(1) == 1 {
         count *= 2;
         extra += 1;
+        if extra > 15 {
+            bail!("ZGFX match length unary run too long (desync?)");
+        }
     }
-    count + reader.get_bits(extra)
+    Ok(count + reader.get_bits(extra))
 }
 
 /// Decompresses data received on the MS-RDPEGFX graphics dynamic virtual channel. The
@@ -175,6 +180,14 @@ impl ZgfxContext {
     fn copy_match(&mut self, distance: usize, count: usize, out: &mut Vec<u8>) -> Result<()> {
         if distance == 0 || distance > HISTORY_SIZE {
             bail!("invalid ZGFX match distance {distance}");
+        }
+        // A legitimate match can never reference further back than everything written so
+        // far in the connection's history — if it does, we've already desynced (a prior
+        // token decoded wrong) rather than this being a real long-range match. Bailing here
+        // instead of silently reading zero-initialized history turns silent corruption into
+        // a precisely-located error.
+        if distance > self.index {
+            bail!("ZGFX match distance {distance} exceeds {} bytes written so far (desync?)", self.index);
         }
         for _ in 0..count {
             let src = (self.index + HISTORY_SIZE - distance) % HISTORY_SIZE;
@@ -210,16 +223,21 @@ impl ZgfxContext {
 
             let distance = (row.value_base + reader.get_bits(row.value_bits as u32)) as usize;
             if distance == 0 {
-                // Unencoded run escape (MS-RDPEGFX §3.1.9.1.2): 15-bit count, then raw
-                // bytes starting on a whole-byte boundary.
-                reader.byte_align();
+                // Unencoded run escape (MS-RDPEGFX §3.1.9.1.2): the 15-bit count is read
+                // FIRST via normal bit-oriented reading (it can straddle a partial byte),
+                // and only THEN are any leftover bits in the current byte discarded, before
+                // the raw bytes begin on a fresh whole-byte boundary. Byte-aligning before
+                // reading the count (as an earlier version of this code did) reads the
+                // wrong 15 bits and leaves every subsequent raw byte permanently
+                // bit-shifted — confirmed against FreeRDP's `zgfx_decompress_segment`.
                 let count = reader.get_bits(15) as usize;
+                reader.byte_align();
                 for _ in 0..count {
                     let b = reader.get_bits(8) as u8;
                     self.write_byte(b, &mut out);
                 }
             } else {
-                let count = decode_length(&mut reader) as usize;
+                let count = decode_length(&mut reader)? as usize;
                 self.copy_match(distance, count, &mut out)?;
             }
         }

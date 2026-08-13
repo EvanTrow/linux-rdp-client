@@ -2,6 +2,7 @@ mod aad;
 mod aad_auto;
 mod bitmap;
 mod capabilities;
+mod clearcodec;
 mod client_info;
 mod dvc;
 mod errinfo;
@@ -10,6 +11,7 @@ mod gfx;
 mod license;
 mod mcs;
 mod rds_aad;
+mod surface;
 mod tls;
 mod vchannel;
 mod window;
@@ -146,6 +148,19 @@ fn parse_target(arg: &str) -> (String, String) {
     };
     let host_name = host_part.split('.').next().unwrap_or(host_part).to_string();
     (format!("{host_part}:{port}"), host_name)
+}
+
+/// Dumps a surface as a binary PPM (P6) — no extra crate needed, and `ImageMagick`/`ffmpeg`
+/// can convert it for viewing. Debug-only, for visually verifying decoded pixel output.
+fn dump_surface_ppm(surf: &surface::Surface, path: &str) -> Result<()> {
+    use std::io::BufWriter;
+    let f = std::fs::File::create(path).context("creating PPM dump file")?;
+    let mut w = BufWriter::new(f);
+    write!(w, "P6\n{} {}\n255\n", surf.width, surf.height)?;
+    for chunk in surf.pixels.chunks_exact(4) {
+        w.write_all(&[chunk[2], chunk[1], chunk[0]])?; // BGRX -> RGB
+    }
+    Ok(())
 }
 
 struct CliArgs {
@@ -393,6 +408,11 @@ fn main() -> Result<()> {
     // unwrapped before the bytes are valid RDPGFX_HEADER-prefixed PDUs. The client's own
     // outgoing PDUs (e.g. CAPS_ADVERTISE above) are sent raw/unwrapped, matching FreeRDP.
     let mut zgfx = zgfx::ZgfxContext::new();
+    let mut surfaces = surface::SurfaceManager::new();
+    let mut clear_ctx = clearcodec::ClearCodecContext::new();
+    // (surface_id, output_origin_x, output_origin_y) — the surface currently presented at
+    // the window's origin, per the last MAP_SURFACE_TO_OUTPUT seen.
+    let mut mapped_surface: Option<(u16, u32, u32)> = None;
     loop {
         let msg = router.recv_dvc_data(&mut tls_stream, user_id, gfx_channel_id)?;
         let msg = zgfx.decompress(&msg)?;
@@ -404,13 +424,18 @@ fn main() -> Result<()> {
                 }
                 gfx::GfxPdu::CreateSurface(s) => {
                     println!("      create surface {}: {}x{} format={:#04x}", s.surface_id, s.width, s.height, s.pixel_format);
+                    surfaces.create(s.surface_id, s.width, s.height);
                 }
-                gfx::GfxPdu::DeleteSurface { surface_id } => println!("      delete surface {surface_id}"),
+                gfx::GfxPdu::DeleteSurface { surface_id } => {
+                    println!("      delete surface {surface_id}");
+                    surfaces.delete(surface_id);
+                }
                 gfx::GfxPdu::MapSurfaceToOutput(m) => {
                     println!(
                         "      map surface {} to output at ({}, {})",
                         m.surface_id, m.output_origin_x, m.output_origin_y
                     );
+                    mapped_surface = Some((m.surface_id, m.output_origin_x, m.output_origin_y));
                 }
                 gfx::GfxPdu::StartFrame { frame_id } => println!("      start frame {frame_id}"),
                 gfx::GfxPdu::EndFrame { frame_id } => {
@@ -422,12 +447,20 @@ fn main() -> Result<()> {
                         gfx_channel_id,
                         &gfx::build_frame_acknowledge(frame_id, frames_decoded),
                     )?;
-                    if got_first_wire_to_surface {
+                    if got_first_wire_to_surface && frames_decoded >= 60 {
+                        if let Some((surface_id, _, _)) = mapped_surface {
+                            if let Some(surf) = surfaces.get(surface_id) {
+                                dump_surface_ppm(surf, "/tmp/claude-1000/-home-evan-git-rdp/7b62a7e4-09f9-42cb-a3dd-b7e68fdf84d3/scratchpad/surface.ppm")?;
+                                println!("      dumped mapped surface {surface_id} to surface.ppm");
+                            }
+                        }
                         println!("\n✅ Phase 2 GFX pipeline is live — receiving real frame data.");
                         return Ok(());
                     }
                 }
                 gfx::GfxPdu::WireToSurface1(w) => {
+                    let width = (w.dest_rect.right - w.dest_rect.left) as u32;
+                    let height = (w.dest_rect.bottom - w.dest_rect.top) as u32;
                     println!(
                         "      wire-to-surface: surface={} codec={:#06x} rect=({},{})-({},{}) bytes={}",
                         w.surface_id,
@@ -439,9 +472,72 @@ fn main() -> Result<()> {
                         w.bitmap_data.len()
                     );
                     got_first_wire_to_surface = true;
+                    if let Some(surf) = surfaces.get_mut(w.surface_id) {
+                        match w.codec_id {
+                            gfx::CODEC_CLEARCODEC => {
+                                if let Err(e) = clear_ctx.decompress(
+                                    &w.bitmap_data,
+                                    surf,
+                                    w.dest_rect.left as u32,
+                                    w.dest_rect.top as u32,
+                                    width,
+                                    height,
+                                ) {
+                                    println!("      ClearCodec decode failed: {e:#}");
+                                }
+                            }
+                            gfx::CODEC_UNCOMPRESSED => {
+                                let expected = (width as usize) * (height as usize) * 4;
+                                if w.bitmap_data.len() >= expected {
+                                    surf.blit_rect(w.dest_rect.left as u32, w.dest_rect.top as u32, width, height, &w.bitmap_data);
+                                } else {
+                                    println!("      uncompressed WIRE_TO_SURFACE_1 too short ({} < {expected})", w.bitmap_data.len());
+                                }
+                            }
+                            other => println!("      (codec {other:#06x} not yet implemented, skipping)"),
+                        }
+                    }
                 }
-                gfx::GfxPdu::SolidFill(_) => println!("      solid fill"),
-                gfx::GfxPdu::SurfaceToSurface(_) => println!("      surface-to-surface"),
+                gfx::GfxPdu::SolidFill(f) => {
+                    println!("      solid fill surface={} rects={}", f.surface_id, f.fill_rects.len());
+                    if let Some(surf) = surfaces.get_mut(f.surface_id) {
+                        // RDPGFX_COLOR32 is blue,green,red,xA(reserved) — matches our BGRX
+                        // surface storage directly, alpha forced opaque.
+                        let bgra = [f.color_bgra[0], f.color_bgra[1], f.color_bgra[2], 0xFF];
+                        for rect in &f.fill_rects {
+                            let (x, y) = (rect.left as u32, rect.top as u32);
+                            let (w, h) = ((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32);
+                            surf.fill_rect(x, y, w, h, bgra);
+                        }
+                    }
+                }
+                gfx::GfxPdu::SurfaceToSurface(s) => {
+                    println!("      surface-to-surface");
+                    let (x, y) = (s.rect_src.left as u32, s.rect_src.top as u32);
+                    let (w, h) = ((s.rect_src.right - s.rect_src.left) as u32, (s.rect_src.bottom - s.rect_src.top) as u32);
+                    if let Some(src) = surfaces.get(s.surface_id_src) {
+                        let extracted = src.extract_rect(x, y, w, h);
+                        if let Some(dst) = surfaces.get_mut(s.surface_id_dst) {
+                            for &(dx, dy) in &s.dest_pts {
+                                dst.blit_rect(dx as u32, dy as u32, w, h, &extracted);
+                            }
+                        }
+                    }
+                }
+                gfx::GfxPdu::SurfaceToCache(s) => {
+                    let (x, y) = (s.rect_src.left as u32, s.rect_src.top as u32);
+                    let (w, h) = ((s.rect_src.right - s.rect_src.left) as u32, (s.rect_src.bottom - s.rect_src.top) as u32);
+                    println!("      surface-to-cache slot={} surface={} rect=({x},{y},{w}x{h})", s.cache_slot, s.surface_id);
+                    surfaces.surface_to_cache(s.surface_id, s.cache_slot, x, y, w, h);
+                }
+                gfx::GfxPdu::CacheToSurface(s) => {
+                    println!("      cache-to-surface slot={}", s.cache_slot);
+                    surfaces.cache_to_surface(s.cache_slot, s.surface_id, &s.dest_pts);
+                }
+                gfx::GfxPdu::EvictCacheEntry { cache_slot } => {
+                    println!("      evict cache entry slot={cache_slot}");
+                    surfaces.evict_cache_entry(cache_slot);
+                }
                 gfx::GfxPdu::Other { cmd_id } => println!("      (other RDPGFX PDU, cmdId={cmd_id:#06x})"),
             }
         }

@@ -3,6 +3,9 @@ use anyhow::{bail, Context, Result};
 pub const CMD_WIRE_TO_SURFACE_1: u16 = 0x0001;
 pub const CMD_SOLID_FILL: u16 = 0x0004;
 pub const CMD_SURFACE_TO_SURFACE: u16 = 0x0005;
+pub const CMD_SURFACE_TO_CACHE: u16 = 0x0006;
+pub const CMD_CACHE_TO_SURFACE: u16 = 0x0007;
+pub const CMD_EVICT_CACHE_ENTRY: u16 = 0x0008;
 pub const CMD_CREATE_SURFACE: u16 = 0x0009;
 pub const CMD_DELETE_SURFACE: u16 = 0x000A;
 pub const CMD_START_FRAME: u16 = 0x000B;
@@ -14,6 +17,7 @@ pub const CMD_CAPS_ADVERTISE: u16 = 0x0012;
 pub const CMD_CAPS_CONFIRM: u16 = 0x0013;
 
 pub const CODEC_UNCOMPRESSED: u16 = 0x0000;
+pub const CODEC_CLEARCODEC: u16 = 0x0008;
 pub const CODEC_CAPROGRESSIVE: u16 = 0x0009;
 
 fn header(cmd_id: u16, payload_len: usize) -> Vec<u8> {
@@ -82,6 +86,7 @@ pub struct MapSurfaceToOutput {
 }
 
 pub struct SolidFill {
+    pub surface_id: u16,
     pub color_bgra: [u8; 4],
     pub fill_rects: Vec<RectU16>,
 }
@@ -90,6 +95,18 @@ pub struct SurfaceToSurface {
     pub surface_id_src: u16,
     pub rect_src: RectU16,
     pub surface_id_dst: u16,
+    pub dest_pts: Vec<(u16, u16)>,
+}
+
+pub struct SurfaceToCache {
+    pub surface_id: u16,
+    pub cache_slot: u16,
+    pub rect_src: RectU16,
+}
+
+pub struct CacheToSurface {
+    pub cache_slot: u16,
+    pub surface_id: u16,
     pub dest_pts: Vec<(u16, u16)>,
 }
 
@@ -106,6 +123,9 @@ pub enum GfxPdu {
     WireToSurface1(WireToSurface1),
     SolidFill(SolidFill),
     SurfaceToSurface(SurfaceToSurface),
+    SurfaceToCache(SurfaceToCache),
+    CacheToSurface(CacheToSurface),
+    EvictCacheEntry { cache_slot: u16 },
     Other { cmd_id: u16 },
 }
 
@@ -210,18 +230,22 @@ pub fn parse_pdu(data: &[u8]) -> Result<GfxPdu> {
             }))
         }
         CMD_SOLID_FILL => {
-            if body.len() < 6 {
+            // RDPGFX_SOLID_FILL_PDU (MS-RDPEGFX §2.2.2.2): surfaceId(2) + fillPixel
+            // (RDPGFX_COLOR32: blue,green,red,xA reserved — 4 bytes) + fillRectCount(2) +
+            // fillRects.
+            if body.len() < 8 {
                 bail!("SOLID_FILL truncated");
             }
-            let color_bgra = [body[0], body[1], body[2], body[3]];
-            let rect_count = u16::from_le_bytes([body[4], body[5]]) as usize;
+            let surface_id = u16::from_le_bytes([body[0], body[1]]);
+            let color_bgra = [body[2], body[3], body[4], body[5]];
+            let rect_count = u16::from_le_bytes([body[6], body[7]]) as usize;
             let mut fill_rects = Vec::with_capacity(rect_count);
-            let mut pos = 6;
+            let mut pos = 8;
             for _ in 0..rect_count {
                 fill_rects.push(read_rect16(&body[pos..])?);
                 pos += 8;
             }
-            Ok(GfxPdu::SolidFill(SolidFill { color_bgra, fill_rects }))
+            Ok(GfxPdu::SolidFill(SolidFill { surface_id, color_bgra, fill_rects }))
         }
         CMD_SURFACE_TO_SURFACE => {
             if body.len() < 12 {
@@ -250,6 +274,43 @@ pub fn parse_pdu(data: &[u8]) -> Result<GfxPdu> {
                 dest_pts,
             }))
         }
+        CMD_SURFACE_TO_CACHE => {
+            if body.len() < 20 {
+                bail!("SURFACE_TO_CACHE truncated");
+            }
+            let surface_id = u16::from_le_bytes([body[0], body[1]]);
+            // bytes 2..10 are cacheKey (u64, opaque) — not needed, we key our own cache by slot.
+            let cache_slot = u16::from_le_bytes([body[10], body[11]]);
+            let rect_src = read_rect16(&body[12..20])?;
+            Ok(GfxPdu::SurfaceToCache(SurfaceToCache { surface_id, cache_slot, rect_src }))
+        }
+        CMD_CACHE_TO_SURFACE => {
+            if body.len() < 6 {
+                bail!("CACHE_TO_SURFACE truncated");
+            }
+            let cache_slot = u16::from_le_bytes([body[0], body[1]]);
+            let surface_id = u16::from_le_bytes([body[2], body[3]]);
+            let pt_count = u16::from_le_bytes([body[4], body[5]]) as usize;
+            let mut dest_pts = Vec::with_capacity(pt_count);
+            let mut pos = 6;
+            for _ in 0..pt_count {
+                if pos + 4 > body.len() {
+                    bail!("CACHE_TO_SURFACE destPts truncated");
+                }
+                dest_pts.push((
+                    u16::from_le_bytes([body[pos], body[pos + 1]]),
+                    u16::from_le_bytes([body[pos + 2], body[pos + 3]]),
+                ));
+                pos += 4;
+            }
+            Ok(GfxPdu::CacheToSurface(CacheToSurface { cache_slot, surface_id, dest_pts }))
+        }
+        CMD_EVICT_CACHE_ENTRY => {
+            if body.len() < 2 {
+                bail!("EVICT_CACHE_ENTRY truncated");
+            }
+            Ok(GfxPdu::EvictCacheEntry { cache_slot: u16::from_le_bytes([body[0], body[1]]) })
+        }
         other => Ok(GfxPdu::Other { cmd_id: other }),
     }
 }
@@ -259,9 +320,10 @@ pub fn parse_pdu(data: &[u8]) -> Result<GfxPdu> {
 pub fn split_pdus(mut data: &[u8]) -> Result<Vec<GfxPdu>> {
     let mut out = Vec::new();
     while data.len() >= 8 {
+        let cmd_id = u16::from_le_bytes([data[0], data[1]]);
         let pdu_length = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
         if pdu_length < 8 || pdu_length > data.len() {
-            bail!("RDPGFX PDU length {pdu_length} invalid ({} bytes remain)", data.len());
+            bail!("RDPGFX PDU length {pdu_length} invalid (cmd_id={cmd_id:#06x}, {} bytes remain)", data.len());
         }
         out.push(parse_pdu(&data[..pdu_length]).context("parsing RDPGFX PDU")?);
         data = &data[pdu_length..];
