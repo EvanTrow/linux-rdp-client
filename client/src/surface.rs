@@ -130,13 +130,17 @@ impl SurfaceManager {
         self.cache.insert(cache_slot, CachedRect { width: w, height: h, pixels });
     }
 
-    pub fn cache_to_surface(&mut self, cache_slot: u16, surface_id: u16, dest_pts: &[(u16, u16)]) {
-        let Some(cached) = self.cache.get(&cache_slot) else { return };
+    /// Returns `false` if `cache_slot` was never populated (a `SurfaceToCache` for it was
+    /// never seen, or it was evicted) — the caller may want to log this, since a miss here
+    /// silently leaves `dest_pts` regions unchanged rather than erroring.
+    pub fn cache_to_surface(&mut self, cache_slot: u16, surface_id: u16, dest_pts: &[(u16, u16)]) -> bool {
+        let Some(cached) = self.cache.get(&cache_slot) else { return false };
         let (w, h, pixels) = (cached.width, cached.height, cached.pixels.clone());
-        let Some(surf) = self.surfaces.get_mut(&surface_id) else { return };
+        let Some(surf) = self.surfaces.get_mut(&surface_id) else { return false };
         for &(dx, dy) in dest_pts {
             surf.blit_rect(dx as u32, dy as u32, w, h, &pixels);
         }
+        true
     }
 
     pub fn evict_cache_entry(&mut self, cache_slot: u16) {

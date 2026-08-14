@@ -219,7 +219,11 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("a rustls CryptoProvider was already installed"))?;
 
     let cli = parse_cli_args()?;
-    let (tile_tx, tile_rx) = std::sync::mpsc::channel();
+    // Bounded to 1: each tile is a full-surface snapshot, not a delta, so there's never a
+    // reason to let more than one sit queued — if the UI thread hasn't drained the last one
+    // yet, a new one fully supersedes it anyway. `try_send` below just drops the tile when
+    // the channel's already full rather than blocking the network thread on a slow UI tick.
+    let (tile_tx, tile_rx) = std::sync::mpsc::sync_channel(1);
     let (input_tx, input_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         if let Err(e) = run_session(cli, tile_tx, input_rx) {
@@ -231,7 +235,7 @@ fn main() -> Result<()> {
 
 fn run_session(
     cli: CliArgs,
-    tile_tx: std::sync::mpsc::Sender<window::BitmapTile>,
+    tile_tx: std::sync::mpsc::SyncSender<window::BitmapTile>,
     input_rx: std::sync::mpsc::Receiver<input::InputEvent>,
 ) -> Result<()> {
     let (host_addr, host_name) = parse_target(&cli.target);
@@ -502,9 +506,13 @@ fn run_session(
                                     pixels: surf.pixels.clone(),
                                     stride: surf.stride(),
                                 };
-                                if tile_tx.send(tile).is_err() {
-                                    // Window closed — nothing left to render for, stop.
-                                    return Ok(());
+                                use std::sync::mpsc::TrySendError;
+                                match tile_tx.try_send(tile) {
+                                    Ok(()) | Err(TrySendError::Full(_)) => {}
+                                    Err(TrySendError::Disconnected(_)) => {
+                                        // Window closed — nothing left to render for, stop.
+                                        return Ok(());
+                                    }
                                 }
                             }
                         }
@@ -583,8 +591,9 @@ fn run_session(
                     surfaces.surface_to_cache(s.surface_id, s.cache_slot, x, y, w, h);
                 }
                 gfx::GfxPdu::CacheToSurface(s) => {
-                    println!("      cache-to-surface slot={}", s.cache_slot);
-                    surfaces.cache_to_surface(s.cache_slot, s.surface_id, &s.dest_pts);
+                    if !surfaces.cache_to_surface(s.cache_slot, s.surface_id, &s.dest_pts) {
+                        println!("      cache-to-surface slot={} MISS (never populated or evicted, {} dest points silently skipped)", s.cache_slot, s.dest_pts.len());
+                    }
                 }
                 gfx::GfxPdu::EvictCacheEntry { cache_slot } => {
                     println!("      evict cache entry slot={cache_slot}");

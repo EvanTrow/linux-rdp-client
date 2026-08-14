@@ -176,7 +176,13 @@ impl<D: SessionDriver> ApplicationHandler for App<D> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        for tile in self.driver.poll() {
+        // Each tile is a full-surface snapshot, not a delta — if the network thread produced
+        // several between UI ticks (a burst of small server updates), every one except the
+        // last is pure wasted work: a ~4MB clone, channel send, and a 1M-pixel blit loop that
+        // gets immediately overwritten by the next tile. Blitting only the latest turns a
+        // burst of N redundant full-frame blits into 1, which is what was actually visible as
+        // UI lag/stutter under real interactive use.
+        if let Some(tile) = self.driver.poll().pop() {
             if let Some(win) = &mut self.win {
                 win.blit_bgrx(tile.x, tile.y, tile.width, tile.height, &tile.pixels, tile.stride);
             }
