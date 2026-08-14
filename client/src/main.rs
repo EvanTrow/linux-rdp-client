@@ -10,10 +10,12 @@ mod gcc;
 mod gfx;
 mod license;
 mod mcs;
+mod nscodec;
 mod rds_aad;
 mod surface;
 mod tls;
 mod vchannel;
+mod input;
 mod window;
 mod x224;
 mod zgfx;
@@ -150,19 +152,6 @@ fn parse_target(arg: &str) -> (String, String) {
     (format!("{host_part}:{port}"), host_name)
 }
 
-/// Dumps a surface as a binary PPM (P6) — no extra crate needed, and `ImageMagick`/`ffmpeg`
-/// can convert it for viewing. Debug-only, for visually verifying decoded pixel output.
-fn dump_surface_ppm(surf: &surface::Surface, path: &str) -> Result<()> {
-    use std::io::BufWriter;
-    let f = std::fs::File::create(path).context("creating PPM dump file")?;
-    let mut w = BufWriter::new(f);
-    write!(w, "P6\n{} {}\n255\n", surf.width, surf.height)?;
-    for chunk in surf.pixels.chunks_exact(4) {
-        w.write_all(&[chunk[2], chunk[1], chunk[0]])?; // BGRX -> RGB
-    }
-    Ok(())
-}
-
 struct CliArgs {
     target: String,
     /// 1Password item UUID to source AAD credentials from. Presence enables the
@@ -201,6 +190,23 @@ fn parse_cli_args() -> Result<CliArgs> {
     })
 }
 
+/// Drives the RDP session (Phase 0-2 handshake, then the ongoing GFX event loop) on a
+/// background thread, sending a full-surface `BitmapTile` after every decoded frame so the
+/// main thread's winit event loop (which must own the main thread) can display it.
+struct NetworkDriver {
+    rx: std::sync::mpsc::Receiver<window::BitmapTile>,
+}
+
+impl window::SessionDriver for NetworkDriver {
+    fn desktop_size(&self) -> (u32, u32) {
+        (DESKTOP_WIDTH as u32, DESKTOP_HEIGHT as u32)
+    }
+
+    fn poll(&mut self) -> Vec<window::BitmapTile> {
+        self.rx.try_iter().collect()
+    }
+}
+
 fn main() -> Result<()> {
     // Pulling in chromiumoxide's rustls-backed HTTP stack (for AAD browser automation)
     // brought a second rustls crypto provider (aws-lc-rs) into the dependency tree
@@ -213,6 +219,21 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("a rustls CryptoProvider was already installed"))?;
 
     let cli = parse_cli_args()?;
+    let (tile_tx, tile_rx) = std::sync::mpsc::channel();
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Err(e) = run_session(cli, tile_tx, input_rx) {
+            eprintln!("session error: {e:#}");
+        }
+    });
+    window::run(NetworkDriver { rx: tile_rx }, input_tx)
+}
+
+fn run_session(
+    cli: CliArgs,
+    tile_tx: std::sync::mpsc::Sender<window::BitmapTile>,
+    input_rx: std::sync::mpsc::Receiver<input::InputEvent>,
+) -> Result<()> {
     let (host_addr, host_name) = parse_target(&cli.target);
 
     let scope = format!("ms-device-service://termsrv.wvd.microsoft.com/name/{host_name}/user_impersonation");
@@ -253,7 +274,15 @@ fn main() -> Result<()> {
 
     println!("[5/6] TLS handshake...");
     let sni_name = host_addr.split(':').next().unwrap_or(&host_addr);
-    let mut tls_stream = tls::upgrade(stream, sni_name).context("TLS handshake")?;
+    let tls_stream = tls::upgrade(stream, sni_name).context("TLS handshake")?;
+    // A short read timeout turns every blocking read in the rest of this function into a
+    // bounded wait — rustls' ClientConnection can't safely be split across threads for
+    // independent concurrent read/write, so real user input (mouse/keyboard, forwarded from
+    // the window on the main thread via `input_rx`) gets sent from right here, flushed
+    // every time a read would otherwise just sit blocked waiting on an idle server. See
+    // `input::DuplexStream` — timeouts are fully absorbed there, never surfaced as errors.
+    tls_stream.sock.set_read_timeout(Some(input::READ_TIMEOUT)).context("setting read timeout")?;
+    let mut tls_stream = input::DuplexStream::new(tls_stream, input_rx);
 
     println!("[6/6] RDS AAD Auth PDU exchange...");
     let server_nonce = rds_aad::recv_server_nonce(&mut tls_stream).context("receiving Server Nonce PDU")?;
@@ -381,6 +410,21 @@ fn main() -> Result<()> {
             Err(e) => println!("      (skipping non-Data PDU: {e:#})"),
         }
     }
+
+    // Quick test: RDS sessions commonly wait for input activity before finishing session
+    // startup (a real client's mouse naturally moves; ours never has). A short burst of
+    // actual movement (not one static point — Windows idle-detection heuristics may care
+    // about motion, not just a single event) now that finalization is complete and the
+    // connection is in the "active" state fast-path input requires.
+    let (cx, cy) = (DESKTOP_WIDTH as i32 / 2, DESKTOP_HEIGHT as i32 / 2);
+    for step in 0..20 {
+        let x = (cx + step * 3).clamp(0, DESKTOP_WIDTH as i32 - 1) as u16;
+        let y = (cy + step * 2).clamp(0, DESKTOP_HEIGHT as i32 - 1) as u16;
+        input::send_mouse_move(&mut tls_stream, x, y).context("sending test mouse move")?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    println!("      sent a burst of test fast-path mouse moves around ({cx}, {cy})");
+
     // This host never sends legacy slow-path Bitmap Update PDUs — it only produces
     // graphics via MS-RDPEGFX over a Dynamic Virtual Channel. The channel's wire name on
     // this host is the long form "Microsoft::Windows::RDS::Graphics", not the short
@@ -447,15 +491,23 @@ fn main() -> Result<()> {
                         gfx_channel_id,
                         &gfx::build_frame_acknowledge(frame_id, frames_decoded),
                     )?;
-                    if got_first_wire_to_surface && frames_decoded >= 60 {
+                    if got_first_wire_to_surface {
                         if let Some((surface_id, _, _)) = mapped_surface {
                             if let Some(surf) = surfaces.get(surface_id) {
-                                dump_surface_ppm(surf, "/tmp/claude-1000/-home-evan-git-rdp/7b62a7e4-09f9-42cb-a3dd-b7e68fdf84d3/scratchpad/surface.ppm")?;
-                                println!("      dumped mapped surface {surface_id} to surface.ppm");
+                                let tile = window::BitmapTile {
+                                    x: 0,
+                                    y: 0,
+                                    width: surf.width,
+                                    height: surf.height,
+                                    pixels: surf.pixels.clone(),
+                                    stride: surf.stride(),
+                                };
+                                if tile_tx.send(tile).is_err() {
+                                    // Window closed — nothing left to render for, stop.
+                                    return Ok(());
+                                }
                             }
                         }
-                        println!("\n✅ Phase 2 GFX pipeline is live — receiving real frame data.");
-                        return Ok(());
                     }
                 }
                 gfx::GfxPdu::WireToSurface1(w) => {

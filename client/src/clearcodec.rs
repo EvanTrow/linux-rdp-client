@@ -157,13 +157,15 @@ impl ClearCodecContext {
                 bail!("ClearCodec glyphIndex {idx} out of range");
             }
             if flags & FLAG_GLYPH_HIT != 0 {
-                let (gw, gh, pixels) = self.glyph_cache[idx]
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("ClearCodec glyph cache miss at index {idx}"))?;
-                if gw as u32 != width || gh as u32 != height {
-                    bail!("ClearCodec glyph cache size mismatch at index {idx}");
+                // A miss/size-mismatch here (same reconnect-cache-predates-connection cause
+                // as the V-Bar case above) means there's no compositePayload in this message
+                // to fall back to at all — nothing to draw. Leaving the destination
+                // untouched and moving on is the best available outcome, not a hard error.
+                if let Some((gw, gh, pixels)) = self.glyph_cache[idx].clone() {
+                    if gw as u32 == width && gh as u32 == height {
+                        blit_bgr_buffer(surface, dest_x, dest_y, width, height, &pixels);
+                    }
                 }
-                blit_bgr_buffer(surface, dest_x, dest_y, width, height, &pixels);
                 return Ok(());
             }
         }
@@ -222,21 +224,30 @@ impl ClearCodecContext {
 
             for x in x_start..=x_end {
                 let header = r.u16()?;
+                // A cache miss here (referencing a V-Bar/short-V-Bar index this client
+                // hasn't actually populated — e.g. because the server's encoder-side cache
+                // predates this connection, such as after reconnecting to an existing RDS
+                // session) must NOT abort the rest of this message: doing so would skip any
+                // later SHORT_VBAR_CACHE_MISS entries still to come in this same stream that
+                // populate the cache, permanently widening the gap between this client's
+                // cursor and the server's on every subsequent message — a self-amplifying
+                // cascade confirmed empirically (missed-index-minus-cursor grew from 0 to
+                // 2000+ over one session when this was a hard bail). Falling back to the
+                // band's background color for just this one V-Bar keeps the rest of the
+                // message — and the cache population within it — intact.
                 let pixels: Vec<[u8; 3]> = if header & 0x8000 != 0 {
                     let idx = (header & 0x7FFF) as usize;
-                    self.vbar_storage[idx]
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("ClearCodec V-Bar cache miss at index {idx}"))?
+                    self.vbar_storage[idx].clone().unwrap_or_else(|| vec![bkg; vbar_height])
                 } else if header & 0xC000 == 0x4000 {
                     let idx = (header & 0x3FFF) as usize;
                     let y_on = r.u8()? as usize;
-                    let short = self.short_vbar_storage[idx]
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("ClearCodec short V-Bar cache miss at index {idx}"))?;
+                    let short = self.short_vbar_storage[idx].clone();
                     let mut full = vec![bkg; vbar_height];
-                    for (i, p) in short.iter().enumerate() {
-                        if y_on + i < vbar_height {
-                            full[y_on + i] = *p;
+                    if let Some(short) = short {
+                        for (i, p) in short.iter().enumerate() {
+                            if y_on + i < vbar_height {
+                                full[y_on + i] = *p;
+                            }
                         }
                     }
                     full
@@ -335,7 +346,13 @@ fn decode_subcodecs(data: &[u8], tile_width: u32, tile_height: u32, tile: &mut [
                 decode_rlex(bitmap_data, width, height, tile_width, tile_height, tile, x_start, y_start)?;
             }
             SUBCODEC_NSCODEC => {
-                bail!("ClearCodec subCodecId=NSCodec (0x01) not implemented");
+                let pixels = crate::nscodec::decompress(bitmap_data, width, height)?;
+                for y in 0..height {
+                    for x in 0..width {
+                        let p = pixels[(y * width + x) as usize];
+                        set_tile_pixel(tile, tile_width, tile_height, x_start + x, y_start + y, p);
+                    }
+                }
             }
             other => bail!("unknown ClearCodec subCodecId {other:#04x}"),
         }

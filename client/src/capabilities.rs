@@ -272,7 +272,13 @@ pub fn build_confirm_active(
     pointer.extend_from_slice(&25u16.to_le_bytes()); // pointerCacheSize
 
     let mut input = Vec::new();
-    input.extend_from_slice(&0x0005u16.to_le_bytes()); // inputFlags: SCANCODES | MOUSEX
+    // inputFlags: SCANCODES(0x0001) | MOUSEX(0x0004) | FASTPATH_INPUT(0x0008) |
+    // FASTPATH_INPUT2(0x0020). FASTPATH_INPUT2 specifically is what every RDP server except
+    // 4.0/5.0/5.1 checks before it'll act on fast-path input events at all (RDP 5.0/5.1 want
+    // just FASTPATH_INPUT alone) — every real Windows Server RDS host is well past that, so
+    // both must be set together (confirmed against FreeRDP's rdp_write_input_capability_set,
+    // which always sets them as a pair, never just one).
+    input.extend_from_slice(&0x002du16.to_le_bytes()); // inputFlags
     input.extend_from_slice(&0u16.to_le_bytes()); // pad2octetsA
     input.extend_from_slice(&0x0000_0409u32.to_le_bytes()); // keyboardLayout: US
     input.extend_from_slice(&4u32.to_le_bytes()); // keyboardType: IBM enhanced 101/102-key
