@@ -8,10 +8,13 @@ interactive input all work — see `PLAN.md` §9), but real-world desktop conten
 renders with two distinct, separate visual defects. Fixing both is required before this
 is a usable replacement for a normal RDP client.
 
+![Both issues at once: large black rectangles (top and bottom bars) plus garbled/missing letters in the sidebar text](docs/screenshots/black-blocks-and-garbled-text.png)
+
 ## Issue 1: large solid black rectangular blocks — root cause known, fix not yet built
 
 Large regions of real application UI (browser tab bars, status bars, some panel
-backgrounds) render as solid black instead of their actual content.
+backgrounds) render as solid black instead of their actual content. See the top and
+bottom bars in the screenshot above.
 
 **Root cause, high confidence**: these are `RDPGFX_WIRE_TO_SURFACE_PDU_2` (cmdId `0x0002`)
 messages, which the client currently parses only far enough to skip (no case for it in
@@ -62,6 +65,10 @@ individual characters or short spans within words are randomly missing or wrong 
 "Receivables" rendering as "ceivables", "Purchases" as "Purch ees". Not the same defect as
 Issue 1 — this happens in regions that ARE getting real content, just with per-character
 corruption, and no full black rectangles.
+
+![Sidebar and content text with individual missing letters — "ceivables" instead of "Receivables", "Rec ivables" in the sidebar, etc. — while most of each word is correct](docs/screenshots/missing-letters-in-text.png)
+
+![The same corruption pattern on a completely fresh RDS session (server-side session logged off and reconnected), ruling out accumulated-reconnect-state as the cause](docs/screenshots/fresh-session-still-corrupted.png)
 
 ### Theories investigated and ruled out
 
