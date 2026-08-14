@@ -1,2 +1,13 @@
 .ssh/
 target/
+
+# Recorded graphics streams (RDP_RECORD=). A capture is the remote desktop's pixels, so it
+# contains whatever was on screen. Never commit one; the only checked-in fixture is the
+# synthetic ghost-regions.rdpgfx, which is generated from solid colours.
+*.rdpgfx
+!client/tests/fixtures/ghost-regions.rdpgfx
+
+# Debug screenshots of live sessions. These are pictures of the remote desktop, so they show
+# whatever was on screen — mail, chat, customer names, colleagues' faces. Kept on disk so they
+# remain available locally for debugging, never committed.
+docs/screenshots/

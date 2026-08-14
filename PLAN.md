@@ -81,7 +81,7 @@ Client application layer on top of this: windowing (one fullscreen borderless wi
 
 ## 9. Progress log
 
-**Phase 0 — done.** TCP/TLS + RDS AAD Auth handshake works end-to-end against the real host (Windows 10 IoT Enterprise LTSC 2024 / Windows 11 24H2 kernel, `<host-ip>` / `<host>`, Entra tenant <organisation>). Two real-world deviations from a literal spec reading, both resolved:
+**Phase 0 — done.** TCP/TLS + RDS AAD Auth handshake works end-to-end against the real host (Windows 10 IoT Enterprise LTSC 2024 / Windows 11 24H2 kernel, a private-network host, redacted). Two real-world deviations from a literal spec reading, both resolved:
 - The spec's own sample OAuth client ID has no service principal in this tenant and needs tenant-admin consent we don't have; swapped to a different Microsoft-owned public client ID (the one `xfreerdp` uses) — still just an OAuth identifier, no third-party code involved.
 - Several assertion/PDU wire-format details (field types, the `u` claim's exact contents, NUL-termination on writes as well as reads) needed cross-checking against FreeRDP's `aad.c` to resolve spec ambiguity.
 
