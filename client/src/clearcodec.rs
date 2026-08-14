@@ -1,4 +1,4 @@
-use crate::surface::Surface;
+use crate::surface::{Surface, WriteOutcome};
 use anyhow::{bail, Result};
 
 const FLAG_GLYPH_INDEX: u8 = 0x01;
@@ -104,7 +104,16 @@ fn bits_needed(x: u32) -> u8 {
 /// the glyph cache).
 pub struct ClearCodecContext {
     seq_number: Option<u8>,
-    glyph_cache: Vec<Option<(u16, u16, Vec<u8>)>>,
+    /// Glyph cache slots, each a flat BGR pixel buffer.
+    ///
+    /// Dimensions are deliberately **not** stored. Per FreeRDP's `clear.c`, a slot records
+    /// only its pixel *count*, a hit is valid whenever `nWidth * nHeight <= count`, and the
+    /// buffer is then re-read at the *requested* dimensions (source stride `nWidth * bpp`).
+    /// Real traffic depends on this: this host reuses a slot for an 8x1 glyph and later reads
+    /// it back as 1x8, and a 4x9 slot as 6x6 — equal pixel counts, different shapes. Requiring
+    /// the dimensions to match drops those glyphs entirely, which on a delta protocol leaves
+    /// the destination rect permanently unpainted.
+    glyph_cache: Vec<Option<Vec<u8>>>,
     vbar_storage: Vec<Option<Vec<[u8; 3]>>>,
     short_vbar_storage: Vec<Option<Vec<[u8; 3]>>>,
     vbar_cursor: usize,
@@ -133,7 +142,7 @@ impl ClearCodecContext {
         dest_y: u32,
         width: u32,
         height: u32,
-    ) -> Result<()> {
+    ) -> Result<WriteOutcome> {
         let mut r = ByteReader::new(data);
         let flags = r.u8()?;
         let seq = r.u8()?;
@@ -158,15 +167,23 @@ impl ClearCodecContext {
             }
             if flags & FLAG_GLYPH_HIT != 0 {
                 // A miss/size-mismatch here (same reconnect-cache-predates-connection cause
-                // as the V-Bar case above) means there's no compositePayload in this message
-                // to fall back to at all — nothing to draw. Leaving the destination
-                // untouched and moving on is the best available outcome, not a hard error.
-                if let Some((gw, gh, pixels)) = self.glyph_cache[idx].clone() {
-                    if gw as u32 == width && gh as u32 == height {
-                        blit_bgr_buffer(surface, dest_x, dest_y, width, height, &pixels);
-                    }
+                // as the V-Bar case below) means there is no compositePayload in this message
+                // to fall back to at all — nothing can be drawn, and the destination rect
+                // keeps whatever was there before, permanently. The session continues (the
+                // caller logs and moves to the next PDU), but this reports rather than
+                // returning Ok as if the update had been applied.
+                let Some(pixels) = self.glyph_cache[idx].clone() else {
+                    bail!("ClearCodec glyph cache hit for index {idx}, which was never populated — nothing was drawn");
+                };
+                let needed = (width as usize) * (height as usize) * 3;
+                if pixels.len() < needed {
+                    bail!(
+                        "ClearCodec glyph cache entry {idx} holds {} pixels, too few for the requested {width}x{height} \
+                         — nothing was drawn",
+                        pixels.len() / 3
+                    );
                 }
-                return Ok(());
+                return Ok(blit_bgr_buffer(surface, dest_x, dest_y, width, height, &pixels));
             }
         }
 
@@ -195,12 +212,12 @@ impl ClearCodecContext {
         }
 
         let flat: Vec<u8> = tile.iter().flat_map(|p| p.iter().copied()).collect();
-        blit_bgr_buffer(surface, dest_x, dest_y, width, height, &flat);
+        let outcome = blit_bgr_buffer(surface, dest_x, dest_y, width, height, &flat);
 
         if let Some(idx) = glyph_index {
-            self.glyph_cache[idx] = Some((width as u16, height as u16, flat));
+            self.glyph_cache[idx] = Some(flat);
         }
-        Ok(())
+        Ok(outcome)
     }
 
     fn decode_bands(&mut self, data: &[u8], width: u32, height: u32, tile: &mut [[u8; 3]]) -> Result<()> {
@@ -236,8 +253,19 @@ impl ClearCodecContext {
                 // band's background color for just this one V-Bar keeps the rest of the
                 // message — and the cache population within it — intact.
                 let pixels: Vec<[u8; 3]> = if header & 0x8000 != 0 {
+                    // VBAR_CACHE_HIT: reuse a previously-composed full V-Bar verbatim. The
+                    // 32768-slot cache is reused across bands of different heights over a
+                    // session (confirmed against FreeRDP's clear.c, which explicitly
+                    // resizes here rather than trusting the stored length), so the cached
+                    // entry's length may not match this band's vbar_height. Resize
+                    // (truncate, or zero-extend like FreeRDP's resize_vbar_entry) instead
+                    // of silently leaving extra rows unpainted.
                     let idx = (header & 0x7FFF) as usize;
-                    self.vbar_storage[idx].clone().unwrap_or_else(|| vec![bkg; vbar_height])
+                    let mut cached = self.vbar_storage[idx].clone().unwrap_or_default();
+                    if cached.len() != vbar_height {
+                        cached.resize(vbar_height, [0, 0, 0]);
+                    }
+                    cached
                 } else if header & 0xC000 == 0x4000 {
                     let idx = (header & 0x3FFF) as usize;
                     let y_on = r.u8()? as usize;
@@ -250,6 +278,15 @@ impl ClearCodecContext {
                             }
                         }
                     }
+                    // A SHORT_VBAR_CACHE_HIT is also a "vBarUpdate" event per FreeRDP's
+                    // clear_decompress_bands_data: the recomposed full V-Bar gets written
+                    // into V-Bar Storage at the current cursor, which then advances — same
+                    // as the cache-miss path below. Skipping this (as this client
+                    // previously did) leaves the cursor permanently behind the server's,
+                    // so every later VBAR_CACHE_HIT index reference resolves to the wrong
+                    // slot for the rest of the connection.
+                    self.vbar_storage[self.vbar_cursor] = Some(full.clone());
+                    self.vbar_cursor = (self.vbar_cursor + 1) % VBAR_SIZE;
                     full
                 } else {
                     let y_on = (header & 0xFF) as usize;
@@ -420,14 +457,94 @@ fn decode_rlex(
     Ok(())
 }
 
-fn blit_bgr_buffer(surface: &mut Surface, dest_x: u32, dest_y: u32, width: u32, height: u32, bgr: &[u8]) {
+/// Blits a tightly-packed 24-bit BGR tile into a surface, reporting how much of it landed.
+/// A ClearCodec draw whose destRect runs off the surface is a dropped server update like any
+/// other, so the shortfall is returned rather than quietly clipped away.
+fn blit_bgr_buffer(surface: &mut Surface, dest_x: u32, dest_y: u32, width: u32, height: u32, bgr: &[u8]) -> WriteOutcome {
+    let mut out = WriteOutcome { requested: width as u64 * height as u64, written: 0, source_truncated: false };
     for y in 0..height {
         for x in 0..width {
             let i = ((y * width + x) * 3) as usize;
             if i + 2 >= bgr.len() {
+                out.source_truncated = true;
                 continue;
             }
-            surface.set_pixel_bgr(dest_x + x, dest_y + y, [bgr[i], bgr[i + 1], bgr[i + 2]]);
+            out.written += surface.set_pixel_bgr(dest_x + x, dest_y + y, [bgr[i], bgr[i + 1], bgr[i + 2]]).written;
         }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Header for a glyph-cache *hit*: flags = GLYPH_INDEX | GLYPH_HIT, then the index.
+    fn glyph_hit_message(seq: u8, index: u16) -> Vec<u8> {
+        let mut v = vec![FLAG_GLYPH_INDEX | FLAG_GLYPH_HIT, seq];
+        v.extend_from_slice(&index.to_le_bytes());
+        v
+    }
+
+    /// A glyph-cache *populate*: flags = GLYPH_INDEX, index, then empty residual/bands/
+    /// subcodec segments, so the composed tile is all zeroes of the given size.
+    fn glyph_store_message(seq: u8, index: u16) -> Vec<u8> {
+        let mut v = vec![FLAG_GLYPH_INDEX, seq];
+        v.extend_from_slice(&index.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // residualByteCount
+        v.extend_from_slice(&0u32.to_le_bytes()); // bandsByteCount
+        v.extend_from_slice(&0u32.to_le_bytes()); // subcodecByteCount
+        v
+    }
+
+    /// Real traffic from the test host reuses one glyph slot at different shapes with the
+    /// same pixel count — an 8x1 glyph read back as 1x8, a 4x9 read back as 6x6. FreeRDP's
+    /// `clear.c` stores only the pixel count and re-reads the buffer at the requested
+    /// dimensions, so these are hits, not errors. Requiring equal dimensions drew nothing and
+    /// left the destination permanently unpainted.
+    #[test]
+    fn a_glyph_slot_may_be_reused_at_a_different_shape_with_the_same_pixel_count() {
+        let mut ctx = ClearCodecContext::new();
+        let mut surface = Surface::new(64, 64);
+
+        // Populate slot 329 as 8x1.
+        let _ = ctx.decompress(&glyph_store_message(0, 329), &mut surface, 0, 0, 8, 1).expect("store 8x1");
+        // Read it back as 1x8 — same 8 pixels, transposed shape.
+        let outcome = ctx.decompress(&glyph_hit_message(1, 329), &mut surface, 0, 0, 1, 8).expect("1x8 hit must draw");
+        assert!(outcome.complete(), "the whole 1x8 rect must be painted");
+
+        // And the 4x9 -> 6x6 case (36 pixels either way).
+        let _ = ctx.decompress(&glyph_store_message(2, 254), &mut surface, 0, 0, 4, 9).expect("store 4x9");
+        let outcome = ctx.decompress(&glyph_hit_message(3, 254), &mut surface, 0, 0, 6, 6).expect("6x6 hit must draw");
+        assert!(outcome.complete());
+    }
+
+    #[test]
+    fn a_glyph_slot_too_small_for_the_request_is_reported_not_drawn() {
+        let mut ctx = ClearCodecContext::new();
+        let mut surface = Surface::new(64, 64);
+        let _ = ctx.decompress(&glyph_store_message(0, 7), &mut surface, 0, 0, 2, 2).expect("store 2x2");
+        // 4x4 needs 16 pixels; the slot holds 4. Drawing it would read past the buffer.
+        let err = ctx.decompress(&glyph_hit_message(1, 7), &mut surface, 0, 0, 4, 4).unwrap_err();
+        assert!(err.to_string().contains("too few"), "got: {err}");
+    }
+
+    #[test]
+    fn a_glyph_hit_on_an_unpopulated_slot_is_reported() {
+        let mut ctx = ClearCodecContext::new();
+        let mut surface = Surface::new(16, 16);
+        let err = ctx.decompress(&glyph_hit_message(0, 100), &mut surface, 0, 0, 4, 4).unwrap_err();
+        assert!(err.to_string().contains("never populated"), "got: {err}");
+    }
+
+    #[test]
+    fn a_sequence_number_gap_is_rejected() {
+        // The seqNumber check is what proves the transport is not dropping whole ClearCodec
+        // messages; it must stay strict.
+        let mut ctx = ClearCodecContext::new();
+        let mut surface = Surface::new(16, 16);
+        let _ = ctx.decompress(&glyph_store_message(0, 1), &mut surface, 0, 0, 2, 2).unwrap();
+        let err = ctx.decompress(&glyph_store_message(5, 2), &mut surface, 0, 0, 2, 2).unwrap_err();
+        assert!(err.to_string().contains("seqNumber gap"), "got: {err}");
     }
 }

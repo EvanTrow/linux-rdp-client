@@ -97,14 +97,58 @@ fn for_each_capability_set<'a>(payload: &'a [u8], mut f: impl FnMut(u16, &'a [u8
     }
 }
 
+/// Runtime switches for bisecting a rendering artifact against the capabilities we
+/// negotiate.
+///
+/// A client that advertises a capability it does not honour makes the *server* behave
+/// correctly and the *picture* wrong: the server legitimately skips content it believes we
+/// already have or can reconstruct, and on a delta protocol it never resends it. That is
+/// indistinguishable, by eye, from a decode bug — so each advertised capability gets a
+/// switch, and the artifact is attributed by elimination instead of by guesswork.
+///
+/// All default off; setting none of them reproduces the shipped negotiation exactly.
+///
+/// | env var | effect |
+/// |---|---|
+/// | `RDP_BISECT_NO_BITMAP_CACHE=1` | omit the Bitmap Cache capability set (type 4) |
+/// | `RDP_BISECT_NO_GLYPH_CACHE=1` | omit the Glyph Cache capability set (type 16) |
+/// | `RDP_BISECT_NO_OFFSCREEN_CACHE=1` | omit the Offscreen Bitmap Cache set (type 17) |
+/// | `RDP_BISECT_ZERO_ORDERS=1` | advertise an all-zero orderSupport instead of the server's |
+/// | `RDP_BISECT_NO_EGFX=1` | do not open the graphics DVC at all |
+///
+/// Persistent bitmap cache is not listed because this client never advertises it: only the
+/// Bitmap Cache **Rev2** capability set (type 19) carries
+/// `PERSISTENT_KEYS_EXPECTED_FLAG`, and we send Rev1 (type 4), never Rev2. No Persistent Key
+/// List PDU is built or sent anywhere in the crate, so the "client claims cache keys for
+/// bitmaps it does not hold" failure mode cannot occur here.
+pub mod bisect {
+    fn on(name: &str) -> bool {
+        std::env::var(name).map(|v| !matches!(v.as_str(), "" | "0" | "false" | "no")).unwrap_or(false)
+    }
+    pub fn no_bitmap_cache() -> bool {
+        on("RDP_BISECT_NO_BITMAP_CACHE")
+    }
+    pub fn no_glyph_cache() -> bool {
+        on("RDP_BISECT_NO_GLYPH_CACHE")
+    }
+    pub fn no_offscreen_cache() -> bool {
+        on("RDP_BISECT_NO_OFFSCREEN_CACHE")
+    }
+    pub fn zero_orders() -> bool {
+        on("RDP_BISECT_ZERO_ORDERS")
+    }
+    pub fn no_egfx() -> bool {
+        on("RDP_BISECT_NO_EGFX")
+    }
+}
+
 /// Extracts the server's own Order Capability Set (orderFlags, orderSupport[32]) from its
 /// Demand Active PDU, so we can echo it straight back in our Confirm Active. Real Windows
 /// hosts reject an all-zero orderSupport with ERRINFO_BADCAPABILITIES instead of the
 /// spec-described graceful bitmap-only fallback — claiming symmetric support is what real
 /// clients (mstsc, FreeRDP) do, even though this client doesn't implement decoding the
-/// primary/secondary drawing orders that support implies. `bitmap::parse_update` treats any
-/// non-bitmap update type as skippable rather than a hard error, as a safety net for
-/// whatever the server ends up sending as a result.
+/// primary/secondary drawing orders that support implies. See `build_confirm_active` for the
+/// consequences and `bisect::zero_orders` for the switch that tests the alternative.
 pub fn extract_order_capability(payload: &[u8]) -> Option<(u16, [u8; 32])> {
     let mut result = None;
     for_each_capability_set(payload, |cap_type, body| {
@@ -240,12 +284,21 @@ pub fn build_confirm_active(
 
     // Real Windows hosts reject an all-zero orderSupport with ERRINFO_BADCAPABILITIES
     // instead of the spec-described graceful bitmap-only fallback (confirmed against a
-    // real Windows 11 24H2 host, 2026-08-12) — echo back exactly what the server itself
-    // advertised in its Demand Active PDU. We don't implement decoding the primary/
-    // secondary drawing orders this implies; `bitmap::parse_update` skips non-bitmap
-    // update types as a safety net rather than erroring.
-    let (server_order_flags, server_order_support) =
-        server_order_capability.unwrap_or((0x0002, [0u8; 32]));
+    // real Windows 11 24H2 host, 2026-08-12) — so echo back exactly what the server itself
+    // advertised in its Demand Active PDU.
+    //
+    // This is a known over-claim: we do not implement any primary or secondary drawing
+    // order. There is NO safety net (an earlier version of this comment claimed
+    // `bitmap::parse_update` was one — it is dead code with no callers anywhere). If this
+    // host ever does send drawing orders, they arrive on the base I/O channel, which the
+    // graphics loop does not read; `session::ChannelRouter` counts and reports those so the
+    // over-claim shows up as a number instead of an assumption. Set
+    // `RDP_BISECT_ZERO_ORDERS=1` to advertise nothing and see whether this host accepts it.
+    let (server_order_flags, server_order_support) = match server_order_capability {
+        _ if bisect::zero_orders() => (0x0002, [0u8; 32]),
+        Some(caps) => caps,
+        None => (0x0002, [0u8; 32]),
+    };
 
     let mut order = Vec::new();
     order.resize(16, 0); // terminalDescriptor
@@ -332,22 +385,27 @@ pub fn build_confirm_active(
     offscreen_cache.extend_from_slice(&0u16.to_le_bytes()); // offscreenCacheSize
     offscreen_cache.extend_from_slice(&0u16.to_le_bytes()); // offscreenCacheEntries
 
-    let sets = [
-        cap_set(1, &general),
-        cap_set(2, &bitmap),
-        cap_set(3, &order),
-        cap_set(4, &bitmap_cache),
-        cap_set(8, &pointer),
-        cap_set(13, &input),
-        cap_set(9, &share),
-        cap_set(12, &sound),
-        cap_set(15, &brush),
-        cap_set(16, &glyph_cache),
-        cap_set(17, &offscreen_cache),
-        cap_set(10, &color_cache),
-        cap_set(14, &font),
-        cap_set(20, &virtual_channel),
-    ];
+    // Capability bisection switches (see `bisect` module docs). Each one removes exactly one
+    // advertised capability so a rendering artifact can be attributed to the negotiation
+    // rather than guessed at. They default off; the shipped behaviour is unchanged.
+    let mut sets = vec![cap_set(1, &general), cap_set(2, &bitmap), cap_set(3, &order)];
+    if !bisect::no_bitmap_cache() {
+        sets.push(cap_set(4, &bitmap_cache));
+    }
+    sets.push(cap_set(8, &pointer));
+    sets.push(cap_set(13, &input));
+    sets.push(cap_set(9, &share));
+    sets.push(cap_set(12, &sound));
+    sets.push(cap_set(15, &brush));
+    if !bisect::no_glyph_cache() {
+        sets.push(cap_set(16, &glyph_cache));
+    }
+    if !bisect::no_offscreen_cache() {
+        sets.push(cap_set(17, &offscreen_cache));
+    }
+    sets.push(cap_set(10, &color_cache));
+    sets.push(cap_set(14, &font));
+    sets.push(cap_set(20, &virtual_channel));
     let number_capabilities = sets.len() as u16;
     let capability_sets: Vec<u8> = sets.concat();
 
