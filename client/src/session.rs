@@ -13,6 +13,7 @@ use crate::{
     aad, capabilities, client_info, dvc, errinfo, gcc, gfx, input, license, mcs, rds_aad, tls, vchannel, window, x224, zgfx,
 };
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -274,6 +275,11 @@ pub fn run_session(
 
     println!("[3/6] connecting to {host_addr}...");
     let mut stream = TcpStream::connect(&host_addr).context("connecting to RDP host")?;
+    // Input PDUs are tiny — a mouse move is ~16 bytes. With Nagle enabled the kernel holds a
+    // small write until the previous segment is acknowledged, which on a normal path adds up
+    // to a delayed-ACK interval (~40ms) to every gesture, and coalesces a drag's worth of
+    // motion into batches. Every real RDP client disables it.
+    stream.set_nodelay(true).context("disabling Nagle on the RDP socket")?;
 
     println!("[4/6] X.224 negotiation (requesting PROTOCOL_RDSAAD)...");
     x224::send_connection_request(&mut stream, MSTSHASH_COOKIE)?;
@@ -299,6 +305,22 @@ pub fn run_session(
     let server_nonce = rds_aad::recv_server_nonce(&mut tls_stream).context("receiving Server Nonce PDU")?;
     let assertion = aad::build_rdp_assertion(&access_token, &resource_uri, &pop_key, &server_nonce, &aad_nonce)
         .context("building RDP Assertion")?;
+    // Non-secret shape of what we are about to present, so a rejection can be compared
+    // against a working client's assertion without a packet capture. Deliberately excludes
+    // the assertion body and the access token inside it — those are bearer credentials.
+    if let Some((header_b64, rest)) = assertion.split_once('.') {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(header_b64)
+            .ok()
+            .and_then(|h| String::from_utf8(h).ok())
+            .unwrap_or_else(|| "<unreadable>".into());
+        println!(
+            "      assertion: header={header} resource_uri={resource_uri:?} server_nonce_len={} aad_nonce_len={} parts={}",
+            server_nonce.len(),
+            aad_nonce.len(),
+            rest.split('.').count() + 1
+        );
+    }
     rds_aad::send_authentication_request(&mut tls_stream, &assertion).context("sending Authentication Request PDU")?;
     rds_aad::recv_authentication_result(&mut tls_stream).context("receiving Authentication Result PDU")?;
 

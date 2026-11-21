@@ -143,7 +143,11 @@ impl DvcManager {
         let field2 = (header >> 2) & 0x3; // Sp (Data) or Len (DataFirst)
         let cb_id = header & 0x3;
         let mut events = Vec::new();
-        eprintln!("[debug] DVC msg: header={header:#04x} cmd={cmd} field2={field2} cb_id={cb_id} len={}", msg.len());
+        // Behind the trace flag: this runs for every message on the graphics channel, i.e.
+        // thousands of times a second under load.
+        if crate::debug::trace() {
+            eprintln!("[debug] DVC msg: header={header:#04x} cmd={cmd} field2={field2} cb_id={cb_id} len={}", msg.len());
+        }
 
         match cmd {
             CMD_CAPABILITY => {
@@ -151,7 +155,7 @@ impl DvcManager {
                     bail!("DVC capability PDU too short");
                 }
                 self.version = u16::from_le_bytes([msg[2], msg[3]]);
-                eprintln!("[debug] DVC capability request: version={:#06x}", self.version);
+                eprintln!("[dvc] capability request: version={:#06x}", self.version);
                 self.send_caps_response(stream, user_id)?;
                 self.caps_negotiated = true;
             }
@@ -165,7 +169,7 @@ impl DvcManager {
                 }
                 let (channel_id, name) = self.parse_create_request(&msg[1..], cb_id)?;
                 let accept = self.wanted.contains(&name);
-                eprintln!("[debug] DVC create request: channel_id={channel_id} name={name:?} wanted={:?} accept={accept}", self.wanted);
+                eprintln!("[dvc] create request: channel_id={channel_id} name={name:?} wanted={:?} accept={accept}", self.wanted);
                 self.send_create_response(stream, user_id, channel_id, cb_id, accept)?;
                 if accept {
                     self.open_channels.insert(name.clone(), channel_id);
@@ -175,7 +179,15 @@ impl DvcManager {
             CMD_DATA => {
                 let (channel_id, consumed) = read_width_field(&msg[1..], cb_id)?;
                 let chunk = &msg[1 + consumed..];
-                eprintln!("[debug] DVC data: channel_id={channel_id} chunk_len={} chunk={:02x?}", chunk.len(), chunk);
+                // Hex-dumping every graphics chunk costs far more than the decode it is
+                // meant to help debug: a 560-byte chunk formats to ~2KB of text, and this
+                // fires for every message on the channel. Formatting *and* the stderr write
+                // are synchronous on the network thread, and when stderr is a terminal the
+                // terminal then has to render all of it — which stalls the reader and shows
+                // up as choppy video, not as a logging problem.
+                if crate::debug::trace() {
+                    eprintln!("[debug] DVC data: channel_id={channel_id} chunk_len={} chunk={:02x?}", chunk.len(), chunk);
+                }
                 if let Some((total, buf)) = self.partial.get_mut(&channel_id) {
                     buf.extend_from_slice(chunk);
                     if buf.len() >= *total {

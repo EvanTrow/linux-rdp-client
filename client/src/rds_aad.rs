@@ -103,20 +103,40 @@ pub fn send_authentication_request<S: Write>(stream: &mut S, rdp_assertion: &str
     write_json_pdu(stream, &json!({ "rdp_assertion": rdp_assertion }))
 }
 
-#[derive(serde::Deserialize)]
-struct AuthResultPdu {
-    authentication_result: i64,
+/// Names the security HRESULTs this exchange actually returns, so a failure says what went
+/// wrong rather than just which hex number went wrong.
+fn describe_auth_hresult(rc: u32) -> &'static str {
+    match rc {
+        0x8009_0308 => "SEC_E_INVALID_TOKEN — the server rejected the RDP assertion itself \
+                        (malformed JWS, bad signature, stale ts/nonce, or wrong `u` audience)",
+        0x8009_030C => "SEC_E_LOGON_DENIED — the assertion was well-formed but the identity was refused",
+        0x8009_030E => "SEC_E_NO_CREDENTIALS",
+        0x8009_0302 => "SEC_E_UNSUPPORTED_FUNCTION",
+        0x8009_0325 => "SEC_E_UNTRUSTED_ROOT",
+        0x8009_0331 => "SEC_E_ALGORITHM_MISMATCH",
+        0x8007_052E => "ERROR_LOGON_FAILURE",
+        _ => "unrecognised security HRESULT",
+    }
 }
 
 /// Returns Ok(()) on S_OK (0x00000000), Err with the HRESULT otherwise.
+///
+/// Deserialised as a free-form `Value` rather than a typed struct on purpose: a typed struct
+/// silently discards every field it does not name, and this PDU is the only place the server
+/// ever explains why it refused us. Anything extra it sends belongs in the error message.
 pub fn recv_authentication_result<S: Read>(stream: &mut S) -> Result<()> {
-    let pdu: AuthResultPdu = read_json_pdu(stream)?;
-    if pdu.authentication_result == 0 {
-        Ok(())
-    } else {
-        bail!(
-            "authentication failed, HRESULT {:#010x}",
-            pdu.authentication_result as u32
-        )
+    let pdu: serde_json::Value = read_json_pdu(stream)?;
+    let rc = pdu
+        .get("authentication_result")
+        .and_then(|v| v.as_i64())
+        .context("Authentication Result PDU has no authentication_result field")?;
+    if rc == 0 {
+        return Ok(());
     }
+    bail!(
+        "authentication failed, HRESULT {:#010x} — {}\n      server's full Authentication Result PDU: {}",
+        rc as u32,
+        describe_auth_hresult(rc as u32),
+        pdu
+    )
 }

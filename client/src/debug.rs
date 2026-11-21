@@ -15,6 +15,7 @@
 //! | `RDP_DEBUG_RECTS=1` | outlines every applied update rect + draws its frame id |
 //! | `RDP_DEBUG_STRICT=1` | turns every swallowed graphics decode failure into a hard error |
 //! | `RDP_DEBUG_TRACE=1` | per-PDU trace of every graphics operation applied |
+//! | `RDP_DEBUG_PERF=1` | frame-to-screen latency percentiles, reported periodically |
 //! | `RDP_RECORD=<path>` | records the raw inbound graphics-channel byte stream to `<path>` |
 //!
 //! ## Reading the tint
@@ -56,6 +57,7 @@ pub struct DebugFlags {
     pub rects: bool,
     pub strict: bool,
     pub trace: bool,
+    pub perf: bool,
     pub record: Option<PathBuf>,
 }
 
@@ -74,9 +76,10 @@ pub fn flags() -> &'static DebugFlags {
             rects: env_on("RDP_DEBUG_RECTS"),
             strict: env_on("RDP_DEBUG_STRICT"),
             trace: env_on("RDP_DEBUG_TRACE"),
+            perf: env_on("RDP_DEBUG_PERF"),
             record: std::env::var("RDP_RECORD").ok().filter(|s| !s.is_empty()).map(PathBuf::from),
         };
-        if f.tint || f.rects || f.strict || f.trace || f.record.is_some() {
+        if f.tint || f.rects || f.strict || f.trace || f.perf || f.record.is_some() {
             eprintln!("[debug] graphics instrumentation active: {f:?}");
         }
         f
@@ -99,6 +102,57 @@ pub fn strict() -> bool {
 
 pub fn trace() -> bool {
     flags().trace
+}
+
+/// Measure how long a decoded frame takes to reach the screen.
+pub fn perf() -> bool {
+    flags().perf
+}
+
+/// Accumulates latency samples and reports percentiles periodically.
+///
+/// Percentiles rather than an average: the complaint that motivates this is "it feels
+/// choppy", and choppiness is the tail. A mean of 4ms hides a p99 of 40ms completely.
+#[derive(Default)]
+pub struct LatencyStats {
+    samples: Vec<u64>,
+    window_started: Option<std::time::Instant>,
+}
+
+/// How many presented frames each report covers. Small enough to see a drag in isolation.
+const LATENCY_REPORT_EVERY: usize = 120;
+
+impl LatencyStats {
+    /// Records one frame-to-screen latency, printing a summary periodically.
+    ///
+    /// Reports the presented frame *rate* alongside the latency because they answer different
+    /// questions: latency is how stale what you see is, rate is how often it changes. Dragging
+    /// a window feels bad if either one is poor, and they have different causes — latency is
+    /// the presentation path, rate is the server plus the decoder.
+    pub fn record(&mut self, micros: u64) {
+        let now = std::time::Instant::now();
+        let started = *self.window_started.get_or_insert(now);
+        self.samples.push(micros);
+        if self.samples.len() < LATENCY_REPORT_EVERY {
+            return;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let fps = self.samples.len() as f64 / elapsed.max(f64::EPSILON);
+        self.samples.sort_unstable();
+        let at = |p: f64| self.samples[((self.samples.len() - 1) as f64 * p) as usize];
+        eprintln!(
+            "[perf] {} frames in {:.1}s = {:.0} fps presented | frame->screen p50={}us p95={}us p99={}us max={}us",
+            self.samples.len(),
+            elapsed,
+            fps,
+            at(0.5),
+            at(0.95),
+            at(0.99),
+            self.samples.last().copied().unwrap_or(0),
+        );
+        self.samples.clear();
+        self.window_started = Some(now);
+    }
 }
 
 /// Reports a graphics-path failure that the code is about to continue past.

@@ -32,9 +32,10 @@ fn main() -> Result<()> {
 
     window::run(
         session::NetworkDriver {
-            frames,
+            frames: frames.clone(),
             desktop: (session::DESKTOP_WIDTH as u32, session::DESKTOP_HEIGHT as u32),
         },
         input_tx,
+        &frames,
     )
 }

@@ -5,7 +5,26 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Window, WindowId};
+
+/// Sent to the event loop the moment a frame is published, so the UI thread wakes on the
+/// frame rather than on a timer.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameReady;
+
+#[derive(Default)]
+struct Mailbox {
+    slot: Mutex<Option<Vec<BitmapTile>>>,
+    closed: AtomicBool,
+    /// Set once, after the event loop exists. Publishing before then is fine — the first
+    /// timer-driven draw picks it up.
+    proxy: OnceLock<EventLoopProxy<FrameReady>>,
+}
 
 /// A single-slot, latest-wins hand-off of decoded frames from the network thread to the UI
 /// thread.
@@ -20,12 +39,6 @@ use std::sync::{Arc, Mutex};
 ///
 /// Overwriting is safe here precisely because each entry is a whole-surface snapshot rather
 /// than a delta, so a newer entry strictly supersedes an unconsumed older one.
-#[derive(Default)]
-struct Mailbox {
-    slot: Mutex<Option<Vec<BitmapTile>>>,
-    closed: AtomicBool,
-}
-
 #[derive(Clone, Default)]
 pub struct FrameMailbox(Arc<Mailbox>);
 
@@ -34,9 +47,24 @@ impl FrameMailbox {
         Self::default()
     }
 
-    /// Publishes the newest frame, superseding any frame the UI thread has not yet consumed.
+    /// Publishes the newest frame, superseding any frame the UI thread has not yet consumed,
+    /// and wakes the event loop immediately.
+    ///
+    /// The wake-up is the point. Without it the UI thread only notices a new frame on its
+    /// next timer tick, and then only *presents* it a tick later still, because
+    /// `request_redraw` is dispatched at the start of the following iteration — up to two
+    /// frame periods of latency added to every single frame, which is what made dragging a
+    /// window feel heavy next to a reference client.
     pub fn publish(&self, tiles: Vec<BitmapTile>) {
         *self.0.slot.lock().expect("frame mailbox poisoned") = Some(tiles);
+        if let Some(proxy) = self.0.proxy.get() {
+            // Fails only once the loop has exited, which `is_closed` already covers.
+            let _ = proxy.send_event(FrameReady);
+        }
+    }
+
+    fn attach_proxy(&self, proxy: EventLoopProxy<FrameReady>) {
+        let _ = self.0.proxy.set(proxy);
     }
 
     /// Takes the newest published frame, if any.
@@ -53,11 +81,6 @@ impl FrameMailbox {
         self.0.closed.store(true, Ordering::Relaxed);
     }
 }
-use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
 
 /// A single fullscreen-desktop-sized window with a CPU-side pixel buffer we blit bitmap
 /// updates into. One instance per real monitor eventually (Phase 3); just one for now.
@@ -109,28 +132,7 @@ impl RemoteDesktopWindow {
     /// framebuffer at (x, y) and requests a redraw. `stride` is bytes per source row.
     pub fn blit_bgrx(&mut self, x: u32, y: u32, w: u32, h: u32, src: &[u8], stride: usize) {
         self.ensure_framebuffer(x + w, y + h);
-        for row in 0..h {
-            let dst_y = y + row;
-            if dst_y >= self.height {
-                break;
-            }
-            let src_row = &src[(row as usize) * stride..];
-            for col in 0..w {
-                let dst_x = x + col;
-                if dst_x >= self.width {
-                    break;
-                }
-                let i = (col as usize) * 4;
-                if i + 3 >= src_row.len() {
-                    break;
-                }
-                let b = src_row[i] as u32;
-                let g = src_row[i + 1] as u32;
-                let r = src_row[i + 2] as u32;
-                self.framebuffer[(dst_y * self.width + dst_x) as usize] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
-            }
-        }
-        self.window.request_redraw();
+        blit_bgrx_rows(&mut self.framebuffer, self.width, self.height, x, y, w, h, src, stride);
     }
 
     /// Resizes the softbuffer surface to match the window. `with_resizable(false)` is only a
@@ -145,6 +147,10 @@ impl RemoteDesktopWindow {
             Ok(()) => {
                 self.surface_width = width;
                 self.surface_height = height;
+                // The freshly-sized buffer holds undefined contents until something presents
+                // into it, so ask for a repaint rather than leaving the window garbled until
+                // the server happens to send another frame.
+                self.window.request_redraw();
             }
             Err(e) => eprintln!("[window] resizing softbuffer surface to {width}x{height} failed: {e}"),
         }
@@ -199,6 +205,60 @@ impl RemoteDesktopWindow {
     }
 }
 
+/// Copies a BGRX8888 rectangle into a `0RGB`-format `u32` framebuffer, clipped to it.
+///
+/// This is the hottest loop in the client: it runs over the whole desktop on every presented
+/// frame, so a per-pixel formulation costs ~1M iterations of bounds-checked shifting per
+/// frame at 1280x800.
+///
+/// It doesn't need to. The decoders store BGRX bytes, so on a little-endian machine a pixel's
+/// four bytes read as a native `u32` are already `0xXXRRGGBB` — and softbuffer ignores the
+/// top byte. The conversion is therefore the identity, and each row reduces to a copy the
+/// compiler can vectorise. The big-endian path keeps the explicit shuffle; it is untested in
+/// anger but this client only ever runs on little-endian hosts today.
+#[allow(clippy::too_many_arguments)]
+pub fn blit_bgrx_rows(
+    dst: &mut [u32],
+    dst_w: u32,
+    dst_h: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    src: &[u8],
+    src_stride: usize,
+) {
+    if x >= dst_w || y >= dst_h {
+        return;
+    }
+    // Clip once, up front, instead of testing every pixel inside the loop.
+    let cols = w.min(dst_w - x) as usize;
+    let rows = h.min(dst_h - y) as usize;
+    if cols == 0 {
+        return;
+    }
+
+    for row in 0..rows {
+        let src_start = row * src_stride;
+        let Some(src_row) = src.get(src_start..src_start + cols * 4) else {
+            // A short source buffer is the caller's bug, but truncating quietly here would
+            // leave a half-drawn frame, so stop rather than paper over it.
+            break;
+        };
+        let dst_start = (y as usize + row) * dst_w as usize + x as usize;
+        let dst_row = &mut dst[dst_start..dst_start + cols];
+
+        #[cfg(target_endian = "little")]
+        for (d, s) in dst_row.iter_mut().zip(src_row.chunks_exact(4)) {
+            *d = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+        }
+        #[cfg(target_endian = "big")]
+        for (d, s) in dst_row.iter_mut().zip(src_row.chunks_exact(4)) {
+            *d = ((s[2] as u32) << 16) | ((s[1] as u32) << 8) | s[0] as u32;
+        }
+    }
+}
+
 /// Trait for whatever drives the RDP session — polled once per event-loop iteration so the
 /// network side can push new frames / consume queued input without blocking window events.
 pub trait SessionDriver {
@@ -219,12 +279,16 @@ pub struct BitmapTile {
     /// BGRX8888, row-major.
     pub pixels: Vec<u8>,
     pub stride: usize,
+    /// When the decoder finished this frame, for the `RDP_DEBUG_PERF` measurement of how
+    /// long a frame takes to reach the screen.
+    pub decoded_at: std::time::Instant,
 }
 
 struct App<D: SessionDriver> {
     driver: D,
     win: Option<RemoteDesktopWindow>,
     input_tx: Sender<InputEvent>,
+    latency: crate::debug::LatencyStats,
     /// Last known cursor position, in desktop pixel coordinates — `MouseInput` events don't
     /// carry a position of their own, only `CursorMoved` does, so we track it here to build
     /// a complete `TS_FP_POINTER_EVENT` (which always needs x/y) on a click.
@@ -240,7 +304,42 @@ impl<D: SessionDriver> App<D> {
     }
 }
 
-impl<D: SessionDriver> ApplicationHandler for App<D> {
+impl<D: SessionDriver> App<D> {
+    /// Consumes the newest published frame and puts it on screen, synchronously.
+    ///
+    /// Presenting here rather than via `request_redraw` matters: a redraw request is
+    /// dispatched at the *start of the next* event-loop iteration, so deferring to it adds a
+    /// whole extra wake-up of latency to every frame.
+    fn draw(&mut self) {
+        // One whole-surface snapshot per mapped output region, all from the same frame, so
+        // every tile must be blitted. (Collapsing a *burst* of frames to the newest happens
+        // upstream in `FrameMailbox`, where superseding an unconsumed full snapshot is safe.)
+        let tiles = self.driver.poll();
+        if tiles.is_empty() {
+            return;
+        }
+        let Some(win) = &mut self.win else { return };
+        for tile in &tiles {
+            win.blit_bgrx(tile.x, tile.y, tile.width, tile.height, &tile.pixels, tile.stride);
+        }
+        if let Err(e) = win.present() {
+            eprintln!("present failed: {e:#}");
+        }
+        if crate::debug::perf() {
+            if let Some(t) = tiles.first() {
+                self.latency.record(t.decoded_at.elapsed().as_micros() as u64);
+            }
+        }
+    }
+}
+
+impl<D: SessionDriver> ApplicationHandler<FrameReady> for App<D> {
+    /// A frame was published. This is the whole point of the proxy: the loop is otherwise
+    /// parked in `ControlFlow::Wait` and wakes exactly when there is something to show.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: FrameReady) {
+        self.draw();
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let (w, h) = self.driver.desktop_size();
         match RemoteDesktopWindow::new(event_loop, w, h) {
@@ -260,6 +359,8 @@ impl<D: SessionDriver> ApplicationHandler for App<D> {
                     win.resize_surface(size.width, size.height);
                 }
             }
+            // The window manager is asking us to repaint (expose, unminimise, resize). New
+            // frames do not come through here — they arrive as `FrameReady`.
             WindowEvent::RedrawRequested => {
                 if let Some(win) = &mut self.win {
                     if let Err(e) = win.present() {
@@ -298,22 +399,13 @@ impl<D: SessionDriver> ApplicationHandler for App<D> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // `poll` returns one whole-surface snapshot per mapped output region, all from the
-        // same frame — so every tile here must be blitted, not just the last one. (Collapsing
-        // a *burst* of frames down to the newest happens upstream, in `FrameMailbox`, where
-        // it is safe: superseding an unconsumed full snapshot loses nothing, whereas dropping
-        // one of this frame's surfaces would leave that output region permanently stale.)
-        let tiles = self.driver.poll();
-        if !tiles.is_empty() {
-            if let Some(win) = &mut self.win {
-                for tile in &tiles {
-                    win.blit_bgrx(tile.x, tile.y, tile.width, tile.height, &tile.pixels, tile.stride);
-                }
-            }
-        }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            std::time::Instant::now() + std::time::Duration::from_millis(16),
-        ));
+        // Park until something actually happens. Frames wake us through the proxy, input and
+        // expose through the usual window events — so there is no reason to spin on a timer,
+        // and a timer would only add latency between a frame arriving and being drawn.
+        event_loop.set_control_flow(ControlFlow::Wait);
+        // A frame published before the proxy was attached (or racing the wake-up) would
+        // otherwise sit unclaimed until the next event; this costs nothing when idle.
+        self.draw();
     }
 }
 
@@ -429,10 +521,11 @@ fn keycode_to_scancode(code: KeyCode) -> Option<(u8, bool)> {
     Some((sc, ext))
 }
 
-pub fn run<D: SessionDriver + 'static>(driver: D, input_tx: Sender<InputEvent>) -> Result<()> {
-    let event_loop = EventLoop::new().context("creating event loop")?;
+pub fn run<D: SessionDriver + 'static>(driver: D, input_tx: Sender<InputEvent>, frames: &FrameMailbox) -> Result<()> {
+    let event_loop = EventLoop::<FrameReady>::with_user_event().build().context("creating event loop")?;
+    frames.attach_proxy(event_loop.create_proxy());
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { driver, win: None, input_tx, cursor_pos: (0, 0) };
+    let mut app = App { driver, win: None, input_tx, latency: Default::default(), cursor_pos: (0, 0) };
     let result = event_loop.run_app(&mut app).context("running event loop");
     app.driver.shutdown();
     result
@@ -443,7 +536,15 @@ mod tests {
     use super::*;
 
     fn tile(marker: u8) -> BitmapTile {
-        BitmapTile { x: 0, y: 0, width: 1, height: 1, pixels: vec![marker, marker, marker, 0xFF], stride: 4 }
+        BitmapTile {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            pixels: vec![marker, marker, marker, 0xFF],
+            stride: 4,
+            decoded_at: std::time::Instant::now(),
+        }
     }
 
     /// The defect this type exists to fix: a `sync_channel(1)` keeps the *oldest* queued
@@ -480,6 +581,134 @@ mod tests {
         let mailbox = FrameMailbox::new();
         mailbox.publish(vec![tile(1), tile(2), tile(3)]);
         assert_eq!(mailbox.take().unwrap().len(), 3);
+    }
+
+    /// The old per-pixel formulation, kept only so the benchmark below can show what the
+    /// current one is worth.
+    fn blit_bgrx_rows_per_pixel(dst: &mut [u32], dst_w: u32, dst_h: u32, w: u32, h: u32, src: &[u8], stride: usize) {
+        for row in 0..h {
+            if row >= dst_h {
+                break;
+            }
+            let src_row = &src[(row as usize) * stride..];
+            for col in 0..w {
+                if col >= dst_w {
+                    break;
+                }
+                let i = (col as usize) * 4;
+                if i + 3 >= src_row.len() {
+                    break;
+                }
+                let b = src_row[i] as u32;
+                let g = src_row[i + 1] as u32;
+                let r = src_row[i + 2] as u32;
+                dst[(row * dst_w + col) as usize] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
+    #[test]
+    fn blit_matches_the_per_pixel_reference() {
+        let (w, h) = (67u32, 33u32);
+        let src: Vec<u8> = (0..(w * h * 4)).map(|i| (i % 251) as u8).collect();
+        let mut a = vec![0u32; (w * h) as usize];
+        let mut b = vec![0u32; (w * h) as usize];
+        blit_bgrx_rows(&mut a, w, h, 0, 0, w, h, &src, (w * 4) as usize);
+        blit_bgrx_rows_per_pixel(&mut b, w, h, w, h, &src, (w * 4) as usize);
+        // softbuffer ignores the top byte, so compare only the 24 bits that are displayed.
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x & 0x00FF_FFFF, y & 0x00FF_FFFF, "pixel {i} differs");
+        }
+    }
+
+    #[test]
+    fn blit_clips_to_the_framebuffer_without_wrapping() {
+        // A tile wider than the destination must clip, not wrap onto the next row.
+        let mut dst = vec![0u32; 4 * 2];
+        let src: Vec<u8> = [9u8, 9, 9, 0xFF].into_iter().cycle().take(6 * 2 * 4).collect();
+        blit_bgrx_rows(&mut dst, 4, 2, 2, 0, 6, 2, &src, 6 * 4);
+        assert_eq!(dst[0], 0, "must not paint left of the destination x");
+        assert_eq!(dst[2] & 0x00FF_FFFF, 0x0009_0909);
+        assert_eq!(dst[3] & 0x00FF_FFFF, 0x0009_0909);
+        assert_eq!(dst[6] & 0x00FF_FFFF, 0x0009_0909, "second row lands at the right offset");
+    }
+
+    /// Not a correctness test — a measurement, so the presentation path's cost is a number
+    /// rather than an opinion. Run with:
+    /// `cargo test --release -- --ignored --nocapture presentation_path_cost`
+    #[test]
+    #[ignore]
+    fn presentation_path_cost() {
+        use std::time::Instant;
+        const W: u32 = 1280;
+        const H: u32 = 800;
+        const N: u32 = 200;
+        let src: Vec<u8> = (0..(W * H * 4)).map(|i| (i % 251) as u8).collect();
+        let mut fb = vec![0u32; (W * H) as usize];
+
+        let t = Instant::now();
+        for _ in 0..N {
+            let _clone = std::hint::black_box(src.clone());
+        }
+        let clone_us = t.elapsed().as_secs_f64() * 1e6 / N as f64;
+
+        let t = Instant::now();
+        for _ in 0..N {
+            blit_bgrx_rows_per_pixel(&mut fb, W, H, W, H, &src, (W * 4) as usize);
+        }
+        let old_us = t.elapsed().as_secs_f64() * 1e6 / N as f64;
+
+        let t = Instant::now();
+        for _ in 0..N {
+            blit_bgrx_rows(&mut fb, W, H, 0, 0, W, H, &src, (W * 4) as usize);
+        }
+        let new_us = t.elapsed().as_secs_f64() * 1e6 / N as f64;
+
+        let mut present = vec![0u32; (W * H) as usize];
+        let t = Instant::now();
+        for _ in 0..N {
+            present.copy_from_slice(&fb);
+            std::hint::black_box(&present);
+        }
+        let present_us = t.elapsed().as_secs_f64() * 1e6 / N as f64;
+
+        println!("\n  full-surface clone (4MB): {clone_us:8.0} us");
+        println!("  blit, per-pixel (old):   {old_us:8.0} us");
+        println!("  blit, row-copy (new):    {new_us:8.0} us   [{:.1}x faster]", old_us / new_us);
+        println!("  framebuffer -> present:  {present_us:8.0} us");
+        println!("  ---");
+        println!("  old per-frame total:     {:8.0} us  ({:.0} fps ceiling)", clone_us + old_us + present_us, 1e6 / (clone_us + old_us + present_us));
+        println!("  new per-frame total:     {:8.0} us  ({:.0} fps ceiling)\n", clone_us + new_us + present_us, 1e6 / (clone_us + new_us + present_us));
+    }
+
+    /// Measures what the per-message DVC hex dump used to cost on the network thread.
+    /// Run with: `cargo test --release -- --ignored --nocapture dvc_hexdump_cost`
+    #[test]
+    #[ignore]
+    fn dvc_hexdump_cost() {
+        use std::io::Write;
+        use std::time::Instant;
+        const N: u32 = 2000;
+        let chunk: Vec<u8> = (0..560u32).map(|i| i as u8).collect();
+
+        let t = Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(format!("[debug] DVC data: chunk_len={} chunk={:02x?}", chunk.len(), chunk));
+        }
+        let fmt_us = t.elapsed().as_secs_f64() * 1e6 / N as f64;
+
+        let mut sink = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let t = Instant::now();
+        for _ in 0..N {
+            let line = format!("[debug] DVC data: chunk_len={} chunk={:02x?}", chunk.len(), chunk);
+            writeln!(sink, "{line}").unwrap();
+        }
+        let fmt_write_us = t.elapsed().as_secs_f64() * 1e6 / N as f64;
+
+        println!("\n  hex-format one 560B chunk:      {fmt_us:7.1} us");
+        println!("  format + write to /dev/null:    {fmt_write_us:7.1} us");
+        println!("  at 2000 msg/s that is {:.0} ms/s of network-thread time", fmt_write_us * 2000.0 / 1000.0);
+        println!("  (a terminal, unlike /dev/null, must then render every line)\n");
     }
 
     #[test]

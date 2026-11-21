@@ -103,6 +103,20 @@ fn main() -> Result<()> {
 
     println!("frames={} digest={:016x}", result.frames, result.digest());
     println!("{}", result.summary);
+    if let Some((p50, p95, p99, max)) = result.decode_percentiles() {
+        println!(
+            "decode+composite per frame: p50={p50}us p95={p95}us p99={p99}us max={max}us  \
+             (a frame over ~16000us is a visible hitch at 60Hz)"
+        );
+        let over = result.frame_decode_us.iter().filter(|&&us| us > 16_000).count();
+        let total: u64 = result.frame_decode_us.iter().sum();
+        println!(
+            "frames over 16ms: {over}/{} ({:.1}%)   total decode {:.1}s of wall clock",
+            result.frames,
+            100.0 * over as f64 / result.frames.max(1) as f64,
+            total as f64 / 1e6
+        );
+    }
     if result.dropped_updates > 0 {
         // Loud on purpose: on a delta protocol each of these is a region the user will keep
         // seeing wrong until something unrelated happens to repaint it.

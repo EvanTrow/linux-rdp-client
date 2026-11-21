@@ -106,11 +106,16 @@ fn send_event<S: Write>(stream: &mut S, ev: &InputEvent) -> Result<()> {
 /// Wraps an inner `Read + Write` transport (the TLS stream) so the network thread's normal
 /// blocking receive loop can also drain and send outgoing input events without needing a
 /// second thread to share TLS state with (rustls' `ClientConnection` isn't safely splittable
-/// across threads without extra synchronization). The inner stream's socket must have a
-/// short read timeout set (see `main.rs`) — every time a read times out with no GFX data
-/// available, that's exactly when we check for and flush pending input, then resume
-/// waiting. From the caller's point of view this is just an ordinary blocking `Read`/`Write`
-/// — timeouts are fully absorbed here, never surfaced as an error.
+/// across threads without extra synchronization). From the caller's point of view this is
+/// just an ordinary blocking `Read`/`Write` — timeouts are fully absorbed here, never
+/// surfaced as an error.
+///
+/// Input is flushed **before every read attempt**, not only when a read times out. That
+/// distinction is the difference between a usable and an unusable drag: dragging a window
+/// makes the server stream graphics continuously, so reads keep succeeding, so a
+/// flush-on-timeout-only policy never fires for as long as the drag lasts. The mouse
+/// positions driving the drag would queue up unsent and go out in a burst during the next
+/// lull, and the remote window would follow the cursor in lurches.
 pub struct DuplexStream<S> {
     inner: S,
     input_rx: Receiver<InputEvent>,
@@ -121,9 +126,28 @@ impl<S: Read + Write> DuplexStream<S> {
         Self { inner, input_rx }
     }
 
+    /// Sends everything queued, collapsing runs of consecutive mouse moves to their final
+    /// position.
+    ///
+    /// A fast drag can produce mouse motion faster than it is worth transmitting, and only
+    /// the newest position is actionable — but a move may not be reordered across a button
+    /// or key event, or a click would land at the wrong place. So runs are collapsed, not
+    /// the whole batch.
     fn flush_pending_input(&mut self) -> std::io::Result<()> {
+        let mut pending_move: Option<InputEvent> = None;
         while let Ok(ev) = self.input_rx.try_recv() {
-            send_event(&mut self.inner, &ev).map_err(std::io::Error::other)?;
+            match ev {
+                InputEvent::MouseMove { .. } => pending_move = Some(ev),
+                other => {
+                    if let Some(mv) = pending_move.take() {
+                        send_event(&mut self.inner, &mv).map_err(std::io::Error::other)?;
+                    }
+                    send_event(&mut self.inner, &other).map_err(std::io::Error::other)?;
+                }
+            }
+        }
+        if let Some(mv) = pending_move.take() {
+            send_event(&mut self.inner, &mv).map_err(std::io::Error::other)?;
         }
         Ok(())
     }
@@ -136,8 +160,11 @@ fn is_timeout(e: &std::io::Error) -> bool {
 impl<S: Read + Write> Read for DuplexStream<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
+            // Before blocking, and before every retry: see the type-level comment. During
+            // heavy server traffic this is the only thing that gets input out at all.
+            self.flush_pending_input()?;
             match self.inner.read(buf) {
-                Err(e) if is_timeout(&e) => self.flush_pending_input()?,
+                Err(e) if is_timeout(&e) => continue,
                 other => return other,
             }
         }
@@ -154,7 +181,92 @@ impl<S: Read + Write> Write for DuplexStream<S> {
     }
 }
 
-/// Short enough that input feels responsive (mouse moves flush promptly even while the
-/// read loop is otherwise idle waiting on the server) without turning the read loop into a
-/// busy-poll.
-pub const READ_TIMEOUT: Duration = Duration::from_millis(30);
+/// How long a read blocks before looping back to flush pending input.
+///
+/// This now only bounds input latency while the server is **idle** — during traffic, input
+/// goes out before every read regardless. It is short because that idle case is exactly when
+/// a user starts moving the mouse, and 30ms of dead time at the start of every gesture is
+/// felt. The cost is a bounded ~200 wakeups/second of an otherwise-idle socket, each a
+/// syscall returning `WouldBlock`.
+pub const READ_TIMEOUT: Duration = Duration::from_millis(5);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// A transport whose reads always succeed immediately — i.e. a server streaming
+    /// continuously, which is what playing a video or dragging a window looks like.
+    #[derive(Default)]
+    struct AlwaysReadable {
+        written: Vec<u8>,
+    }
+
+    impl Read for AlwaysReadable {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf[0] = 0xAA;
+            Ok(1)
+        }
+    }
+
+    impl Write for AlwaysReadable {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The regression that made the client uncontrollable during video playback: input used
+    /// to be sent *only* from the read-timeout branch, so a server that never goes quiet
+    /// meant input was never transmitted at all — for as long as the traffic lasted.
+    #[test]
+    fn input_is_sent_even_when_reads_never_time_out() {
+        let (tx, rx) = mpsc::channel();
+        let mut stream = DuplexStream::new(AlwaysReadable::default(), rx);
+        tx.send(InputEvent::MouseMove { x: 100, y: 200 }).unwrap();
+
+        let mut buf = [0u8; 8];
+        stream.read(&mut buf).expect("read");
+
+        assert!(
+            !stream.inner.written.is_empty(),
+            "input must reach the server while it is streaming, not only once it falls silent"
+        );
+    }
+
+    #[test]
+    fn a_run_of_mouse_moves_collapses_to_the_latest_position() {
+        let (tx, rx) = mpsc::channel();
+        let mut stream = DuplexStream::new(AlwaysReadable::default(), rx);
+        for x in 0..10u16 {
+            tx.send(InputEvent::MouseMove { x, y: x }).unwrap();
+        }
+        let mut buf = [0u8; 8];
+        stream.read(&mut buf).expect("read");
+
+        // One fast-path PDU, not ten: only the newest position is actionable.
+        let one_move = build_fastpath_pdu(&[mouse_event(PTR_FLAGS_MOVE, 9, 9)]);
+        assert_eq!(stream.inner.written, one_move, "only the final position should be sent");
+    }
+
+    #[test]
+    fn a_click_is_never_reordered_before_the_move_that_preceded_it() {
+        let (tx, rx) = mpsc::channel();
+        let mut stream = DuplexStream::new(AlwaysReadable::default(), rx);
+        tx.send(InputEvent::MouseMove { x: 5, y: 5 }).unwrap();
+        tx.send(InputEvent::MouseMove { x: 40, y: 60 }).unwrap();
+        tx.send(InputEvent::MouseButton { x: 40, y: 60, button: PTR_FLAGS_BUTTON1, down: true }).unwrap();
+        let mut buf = [0u8; 8];
+        stream.read(&mut buf).expect("read");
+
+        let mut expected = build_fastpath_pdu(&[mouse_event(PTR_FLAGS_MOVE, 40, 60)]);
+        expected.extend_from_slice(&build_fastpath_pdu(&[mouse_event(PTR_FLAGS_DOWN | PTR_FLAGS_BUTTON1, 40, 60)]));
+        assert_eq!(
+            stream.inner.written, expected,
+            "collapsing moves must not let a click overtake the position it was made at"
+        );
+    }
+}

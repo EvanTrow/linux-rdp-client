@@ -118,6 +118,12 @@ pub struct ClearCodecContext {
     short_vbar_storage: Vec<Option<Vec<[u8; 3]>>>,
     vbar_cursor: usize,
     short_vbar_cursor: usize,
+    /// Cache references the server made that this client could not satisfy. Each one paints
+    /// something other than what the server intended — black for a missing V-Bar, the band
+    /// background for a missing short V-Bar — with no decode error raised, so without a
+    /// counter they are invisible. Non-zero here means real pixels are wrong.
+    vbar_misses: u64,
+    short_vbar_misses: u64,
 }
 
 impl ClearCodecContext {
@@ -129,7 +135,14 @@ impl ClearCodecContext {
             short_vbar_storage: vec![None; SHORT_VBAR_SIZE],
             vbar_cursor: 0,
             short_vbar_cursor: 0,
+            vbar_misses: 0,
+            short_vbar_misses: 0,
         }
+    }
+
+    /// (V-Bar misses, short-V-Bar misses) so far this connection.
+    pub fn cache_misses(&self) -> (u64, u64) {
+        (self.vbar_misses, self.short_vbar_misses)
     }
 
     /// Decodes one `RDPGFX_WIRE_TO_SURFACE_PDU_1` ClearCodec (`codecId=0x0008`) bitmap
@@ -261,7 +274,23 @@ impl ClearCodecContext {
                     // (truncate, or zero-extend like FreeRDP's resize_vbar_entry) instead
                     // of silently leaving extra rows unpainted.
                     let idx = (header & 0x7FFF) as usize;
-                    let mut cached = self.vbar_storage[idx].clone().unwrap_or_default();
+                    let mut cached = match self.vbar_storage[idx].clone() {
+                        Some(v) => v,
+                        None => {
+                            // Referencing a slot this client never populated. The column is
+                            // painted black, which is simply wrong content — count it, since
+                            // nothing else here will.
+                            self.vbar_misses += 1;
+                            if self.vbar_misses.is_power_of_two() {
+                                eprintln!(
+                                    "[gfx] ClearCodec: {} V-Bar cache miss(es); slot {idx} was never populated, \
+                                     so that column is painted black",
+                                    self.vbar_misses
+                                );
+                            }
+                            Vec::new()
+                        }
+                    };
                     if cached.len() != vbar_height {
                         cached.resize(vbar_height, [0, 0, 0]);
                     }
@@ -271,10 +300,24 @@ impl ClearCodecContext {
                     let y_on = r.u8()? as usize;
                     let short = self.short_vbar_storage[idx].clone();
                     let mut full = vec![bkg; vbar_height];
-                    if let Some(short) = short {
-                        for (i, p) in short.iter().enumerate() {
-                            if y_on + i < vbar_height {
-                                full[y_on + i] = *p;
+                    match short {
+                        Some(short) => {
+                            for (i, p) in short.iter().enumerate() {
+                                if y_on + i < vbar_height {
+                                    full[y_on + i] = *p;
+                                }
+                            }
+                        }
+                        None => {
+                            // The run this column should show was never cached, so the column
+                            // keeps the band background instead of its real content.
+                            self.short_vbar_misses += 1;
+                            if self.short_vbar_misses.is_power_of_two() {
+                                eprintln!(
+                                    "[gfx] ClearCodec: {} short-V-Bar cache miss(es); slot {idx} was never populated, \
+                                     so that column shows the band background",
+                                    self.short_vbar_misses
+                                );
                             }
                         }
                     }

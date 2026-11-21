@@ -21,6 +21,25 @@ pub struct ReplayResult {
     pub summary: String,
     pub dropped_updates: u64,
     pub parse_failures: u64,
+    /// Wall-clock microseconds spent decoding+compositing each presented frame, in arrival
+    /// order. Replay is single-threaded with no network, so this isolates codec cost from
+    /// everything else — which is the only way to tell a decoder stall apart from a
+    /// presentation stall when the user reports "it feels choppy".
+    pub frame_decode_us: Vec<u64>,
+}
+
+impl ReplayResult {
+    /// Decode-time distribution. The tail matters more than the mean: one 40ms frame in a
+    /// hundred is a visible hitch, and an average hides it completely.
+    pub fn decode_percentiles(&self) -> Option<(u64, u64, u64, u64)> {
+        if self.frame_decode_us.is_empty() {
+            return None;
+        }
+        let mut v = self.frame_decode_us.clone();
+        v.sort_unstable();
+        let at = |p: f64| v[((v.len() - 1) as f64 * p) as usize];
+        Some((at(0.5), at(0.95), at(0.99), *v.last().unwrap()))
+    }
 }
 
 impl ReplayResult {
@@ -48,6 +67,8 @@ pub fn replay(
     let (mut fb_w, mut fb_h) = desktop;
     let mut framebuffer = vec![0u8; (fb_w as usize) * (fb_h as usize) * 4];
     let mut frames = 0u32;
+    let mut frame_decode_us: Vec<u64> = Vec::new();
+    let mut frame_start = std::time::Instant::now();
 
     'outer: for entry in entries {
         let RecordEntry::GfxMessage(raw) = entry else { continue };
@@ -57,6 +78,7 @@ pub fn replay(
         for action in state.apply_message(&msg)? {
             let GfxAction::EndFrame { .. } = action;
             frames += 1;
+            frame_decode_us.push(frame_start.elapsed().as_micros() as u64);
             let (dw, dh) = state.desktop_size();
             if (dw, dh) != (fb_w, fb_h) {
                 fb_w = dw;
@@ -67,6 +89,7 @@ pub fn replay(
                 blit_into(&mut framebuffer, fb_w, fb_h, &tile);
             }
             on_frame(frames, fb_w, fb_h, &framebuffer);
+            frame_start = std::time::Instant::now();
             if stop_after == Some(frames) {
                 break 'outer;
             }
@@ -80,6 +103,7 @@ pub fn replay(
         summary: state.summary(),
         dropped_updates: state.stats.dropped_updates,
         parse_failures: state.stats.parse_failures,
+        frame_decode_us,
     })
 }
 

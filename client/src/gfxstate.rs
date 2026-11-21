@@ -546,7 +546,15 @@ impl GfxState {
                 }
             }
 
-            tiles.push(BitmapTile { x: ox, y: oy, width: w, height: h, pixels, stride: (w as usize) * 4 });
+            tiles.push(BitmapTile {
+                x: ox,
+                y: oy,
+                width: w,
+                height: h,
+                pixels,
+                stride: (w as usize) * 4,
+                decoded_at: std::time::Instant::now(),
+            });
         }
 
         if rects {
